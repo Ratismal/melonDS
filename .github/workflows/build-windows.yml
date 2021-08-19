@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - wifi-savestate
   pull_request:
     branches:
       - master
