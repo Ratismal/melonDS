@@ -310,13 +310,14 @@ void SetIRQ15()
     if (IOPORT(W_PowerTX) & 0x0001)
     {
         IOPORT(W_RFPins) |= 0x0080;
-        IOPORT(W_RFStatus) = 1;
+        IOPORT(W_RFStatus) = 9;
     }
 }
 
 
 void SetStatus(u32 status)
 {
+    status = 9;
     // TODO, eventually: states 2/4, also find out what state 7 is
     u16 rfpins[10] = {0x04, 0x84, 0, 0x46, 0, 0x84, 0x87, 0, 0x46, 0x04};
     IOPORT(W_RFStatus) = status;
