@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -52,20 +52,26 @@ const int hk_general[] =
 {
     HK_Pause,
     HK_Reset,
+    HK_FrameStep,
     HK_FastForward,
     HK_FastForwardToggle,
+    HK_FullscreenToggle,
     HK_Lid,
     HK_Mic,
+    HK_SwapScreens
 };
 
 const char* hk_general_labels[] =
 {
     "Pause/resume",
     "Reset",
+    "Frame step",
     "Fast forward",
     "Toggle FPS limit",
+    "Toggle Fullscreen",
     "Close/open lid",
     "Microphone",
+    "Swap screens"
 };
 
 
@@ -86,7 +92,7 @@ InputConfigDialog::InputConfigDialog(QWidget* parent) : QDialog(parent), ui(new 
         addonsJoyMap[i] = Config::HKJoyMapping[hk_addons[i]];
     }
 
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 9; i++)
     {
         hkGeneralKeyMap[i] = Config::HKKeyMapping[hk_general[i]];
         hkGeneralJoyMap[i] = Config::HKJoyMapping[hk_general[i]];
@@ -94,7 +100,7 @@ InputConfigDialog::InputConfigDialog(QWidget* parent) : QDialog(parent), ui(new 
 
     populatePage(ui->tabInput, 12, dskeylabels, keypadKeyMap, keypadJoyMap);
     populatePage(ui->tabAddons, 2, hk_addons_labels, addonsKeyMap, addonsJoyMap);
-    populatePage(ui->tabHotkeysGeneral, 6, hk_general_labels, hkGeneralKeyMap, hkGeneralJoyMap);
+    populatePage(ui->tabHotkeysGeneral, 9, hk_general_labels, hkGeneralKeyMap, hkGeneralJoyMap);
 
     int njoy = SDL_NumJoysticks();
     if (njoy > 0)
@@ -177,7 +183,7 @@ void InputConfigDialog::on_InputConfigDialog_accepted()
         Config::HKJoyMapping[hk_addons[i]] = addonsJoyMap[i];
     }
 
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 9; i++)
     {
         Config::HKKeyMapping[hk_general[i]] = hkGeneralKeyMap[i];
         Config::HKJoyMapping[hk_general[i]] = hkGeneralJoyMap[i];
@@ -214,6 +220,7 @@ KeyMapButton::KeyMapButton(int* mapping, bool hotkey) : QPushButton()
 
     setCheckable(true);
     setText(mappingText());
+    setFocusPolicy(Qt::StrongFocus); //Fixes binding keys in macOS
 
     connect(this, &KeyMapButton::clicked, this, &KeyMapButton::onClick);
 }
@@ -226,7 +233,7 @@ void KeyMapButton::keyPressEvent(QKeyEvent* event)
 {
     if (!isChecked()) return QPushButton::keyPressEvent(event);
 
-    printf("KEY PRESSED = %08X %08X | %08X %08X %08X\n", event->key(), event->modifiers(), event->nativeVirtualKey(), event->nativeModifiers(), event->nativeScanCode());
+    printf("KEY PRESSED = %08X %08X | %08X %08X %08X\n", event->key(), (int)event->modifiers(), event->nativeVirtualKey(), event->nativeModifiers(), event->nativeScanCode());
 
     int key = event->key();
     int mod = event->modifiers();
@@ -289,6 +296,7 @@ QString KeyMapButton::mappingText()
     QString isright = (key & (1<<31)) ? "Right " : "Left ";
     key &= ~(1<<31);
 
+#ifndef __APPLE__
     switch (key)
     {
     case Qt::Key_Control: return isright + "Ctrl";
@@ -297,13 +305,22 @@ QString KeyMapButton::mappingText()
     case Qt::Key_Shift:   return isright + "Shift";
     case Qt::Key_Meta:    return "Meta";
     }
+#else
+    switch (key)
+    {
+    case Qt::Key_Control: return isright + "⌘";
+    case Qt::Key_Alt:     return isright + "⌥";
+    case Qt::Key_Shift:   return isright + "⇧";
+    case Qt::Key_Meta:    return isright + "⌃";
+    }
+#endif
 
     QKeySequence seq(key);
-    QString ret = seq.toString();
+    QString ret = seq.toString(QKeySequence::NativeText);
 
     // weak attempt at detecting garbage key names
-    if (ret.length() == 2 && ret[0].unicode() > 0xFF)
-        return QString("[%1]").arg(key, 8, 16);
+    //if (ret.length() == 2 && ret[0].unicode() > 0xFF)
+    //    return QString("[%1]").arg(key, 8, 16);
 
     return ret.replace("&", "&&");
 }

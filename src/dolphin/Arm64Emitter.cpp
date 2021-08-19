@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <vector>
+#include <limits>
 
 #include "Compat.h"
 #include "Align.h"
@@ -14,6 +15,10 @@
 #include "BitUtils.h"
 #include "../types.h"
 #include "MathUtil.h"
+
+#ifdef __APPLE__
+    #include <libkern/OSCacheControl.h>
+#endif
 
 namespace Arm64Gen
 {
@@ -384,7 +389,7 @@ void ARM64XEmitter::FlushIcacheSection(u8* start, u8* end)
   if (start == end)
     return;
 
-#if defined(IOS)
+#if defined(__APPLE__)
   // Header file says this is equivalent to: sys_icache_invalidate(start, end - start);
   sys_cache_control(kCacheFunctionPrepareForExecution, start, end - start);
 #else
@@ -1602,7 +1607,21 @@ void ARM64XEmitter::BICS(ARM64Reg Rd, ARM64Reg Rn, ARM64Reg Rm, ArithOption Shif
 
 void ARM64XEmitter::MOV(ARM64Reg Rd, ARM64Reg Rm, ArithOption Shift)
 {
-  ORR(Rd, Is64Bit(Rd) ? ZR : WZR, Rm, Shift);
+  if (Shift.GetType() == ArithOption::TYPE_SHIFTEDREG)
+  {
+    switch (Shift.GetShiftType())
+    {
+    case ST_LSL: LSL(Rd, Rm, Shift.GetShiftAmount()); break;
+    case ST_LSR: LSR(Rd, Rm, Shift.GetShiftAmount()); break;
+    case ST_ASR: ASR(Rd, Rm, Shift.GetShiftAmount()); break;
+    case ST_ROR: ROR(Rd, Rm, Shift.GetShiftAmount()); break;
+    default: ASSERT_MSG(DYNA_REC, false, "Invalid shift type"); break;
+    }
+  }
+  else
+  {
+    ORR(Rd, Is64Bit(Rd) ? ZR : WZR, Rm, Shift);
+  }
 }
 
 void ARM64XEmitter::MOV(ARM64Reg Rd, ARM64Reg Rm)
@@ -1631,7 +1650,7 @@ void ARM64XEmitter::ASR(ARM64Reg Rd, ARM64Reg Rm, int shift)
   int bits = Is64Bit(Rd) ? 64 : 32;
   SBFM(Rd, Rm, shift, bits - 1);
 }
-void ARM64XEmitter::ROR_(ARM64Reg Rd, ARM64Reg Rm, int shift)
+void ARM64XEmitter::ROR(ARM64Reg Rd, ARM64Reg Rm, int shift)
 {
   EXTR(Rd, Rm, Rm, shift);
 }

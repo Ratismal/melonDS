@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -39,8 +39,11 @@ int WindowMaximized;
 int ScreenRotation;
 int ScreenGap;
 int ScreenLayout;
+int ScreenSwap;
 int ScreenSizing;
 int IntegerScaling;
+int ScreenAspectTop;
+int ScreenAspectBot;
 int ScreenFilter;
 
 int ScreenUseGL;
@@ -66,13 +69,21 @@ int DirectLAN;
 
 int SavestateRelocSRAM;
 
+int AudioInterp;
 int AudioVolume;
 int MicInputType;
 char MicWavPath[1024];
 
 char LastROMFolder[1024];
 
+char RecentROMList[10][1024];
+
 int EnableCheats;
+
+int MouseHide;
+int MouseHideSeconds;
+
+int PauseLostFocus;
 
 bool EnableJIT;
 
@@ -110,8 +121,11 @@ ConfigEntry PlatformConfigFile[] =
     {"HKKey_Reset",               0, &HKKeyMapping[HK_Reset],               -1, NULL, 0},
     {"HKKey_FastForward",         0, &HKKeyMapping[HK_FastForward],         -1, NULL, 0},
     {"HKKey_FastForwardToggle",   0, &HKKeyMapping[HK_FastForwardToggle],   -1, NULL, 0},
+    {"HKKey_FullscreenToggle",    0, &HKKeyMapping[HK_FullscreenToggle],    -1, NULL, 0},
+    {"HKKey_SwapScreens",         0, &HKKeyMapping[HK_SwapScreens],         -1, NULL, 0},
     {"HKKey_SolarSensorDecrease", 0, &HKKeyMapping[HK_SolarSensorDecrease], -1, NULL, 0},
     {"HKKey_SolarSensorIncrease", 0, &HKKeyMapping[HK_SolarSensorIncrease], -1, NULL, 0},
+    {"HKKey_FrameStep",           0, &HKKeyMapping[HK_FrameStep],           -1, NULL, 0},
 
     {"HKJoy_Lid",                 0, &HKJoyMapping[HK_Lid],                 -1, NULL, 0},
     {"HKJoy_Mic",                 0, &HKJoyMapping[HK_Mic],                 -1, NULL, 0},
@@ -119,8 +133,11 @@ ConfigEntry PlatformConfigFile[] =
     {"HKJoy_Reset",               0, &HKJoyMapping[HK_Reset],               -1, NULL, 0},
     {"HKJoy_FastForward",         0, &HKJoyMapping[HK_FastForward],         -1, NULL, 0},
     {"HKJoy_FastForwardToggle",   0, &HKJoyMapping[HK_FastForwardToggle],   -1, NULL, 0},
+    {"HKJoy_FullscreenToggle",    0, &HKJoyMapping[HK_FullscreenToggle],    -1, NULL, 0},
+    {"HKJoy_SwapScreens",         0, &HKJoyMapping[HK_SwapScreens],         -1, NULL, 0},
     {"HKJoy_SolarSensorDecrease", 0, &HKJoyMapping[HK_SolarSensorDecrease], -1, NULL, 0},
     {"HKJoy_SolarSensorIncrease", 0, &HKJoyMapping[HK_SolarSensorIncrease], -1, NULL, 0},
+    {"HKJoy_FrameStep",           0, &HKJoyMapping[HK_FrameStep],           -1, NULL, 0},
 
     {"JoystickID", 0, &JoystickID, 0, NULL, 0},
 
@@ -131,8 +148,11 @@ ConfigEntry PlatformConfigFile[] =
     {"ScreenRotation", 0, &ScreenRotation, 0, NULL, 0},
     {"ScreenGap",      0, &ScreenGap,      0, NULL, 0},
     {"ScreenLayout",   0, &ScreenLayout,   0, NULL, 0},
+    {"ScreenSwap",     0, &ScreenSwap,     0, NULL, 0},
     {"ScreenSizing",   0, &ScreenSizing,   0, NULL, 0},
     {"IntegerScaling", 0, &IntegerScaling, 0, NULL, 0},
+    {"ScreenAspectTop",0, &ScreenAspectTop,0, NULL, 0},
+    {"ScreenAspectBot",0, &ScreenAspectBot,0, NULL, 0},
     {"ScreenFilter",   0, &ScreenFilter,   1, NULL, 0},
 
     {"ScreenUseGL",         0, &ScreenUseGL,         0, NULL, 0},
@@ -145,8 +165,8 @@ ConfigEntry PlatformConfigFile[] =
     {"GL_ScaleFactor", 0, &GL_ScaleFactor, 1, NULL, 0},
     {"GL_BetterPolygons", 0, &GL_BetterPolygons, 0, NULL, 0},
 
-    {"LimitFPS", 0, &LimitFPS, 0, NULL, 0},
-    {"AudioSync", 0, &AudioSync, 1, NULL, 0},
+    {"LimitFPS", 0, &LimitFPS, 1, NULL, 0},
+    {"AudioSync", 0, &AudioSync, 0, NULL, 0},
     {"ShowOSD", 0, &ShowOSD, 1, NULL, 0},
 
     {"ConsoleType", 0, &ConsoleType, 0, NULL, 0},
@@ -158,13 +178,29 @@ ConfigEntry PlatformConfigFile[] =
 
     {"SavStaRelocSRAM", 0, &SavestateRelocSRAM, 0, NULL, 0},
 
+    {"AudioInterp", 0, &AudioInterp, 0, NULL, 0},
     {"AudioVolume", 0, &AudioVolume, 256, NULL, 0},
     {"MicInputType", 0, &MicInputType, 1, NULL, 0},
     {"MicWavPath", 1, MicWavPath, 0, "", 1023},
 
     {"LastROMFolder", 1, LastROMFolder, 0, "", 1023},
 
+    {"RecentROM_0", 1, RecentROMList[0], 0, "", 1023},
+    {"RecentROM_1", 1, RecentROMList[1], 0, "", 1023},
+    {"RecentROM_2", 1, RecentROMList[2], 0, "", 1023},
+    {"RecentROM_3", 1, RecentROMList[3], 0, "", 1023},
+    {"RecentROM_4", 1, RecentROMList[4], 0, "", 1023},
+    {"RecentROM_5", 1, RecentROMList[5], 0, "", 1023},
+    {"RecentROM_6", 1, RecentROMList[6], 0, "", 1023},
+    {"RecentROM_7", 1, RecentROMList[7], 0, "", 1023},
+    {"RecentROM_8", 1, RecentROMList[8], 0, "", 1023},
+    {"RecentROM_9", 1, RecentROMList[9], 0, "", 1023},
+
     {"EnableCheats", 0, &EnableCheats, 0, NULL, 0},
+
+    {"MouseHide",        0, &MouseHide,        0, NULL, 0},
+    {"MouseHideSeconds", 0, &MouseHideSeconds, 5, NULL, 0},
+    {"PauseLostFocus",   0, &PauseLostFocus,   0, NULL, 0},
 
     {"", -1, NULL, 0, NULL, 0}
 };

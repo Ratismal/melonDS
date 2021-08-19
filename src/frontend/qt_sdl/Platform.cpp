@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -19,10 +19,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef __WIN32__
+    #define NTDDI_VERSION        0x06000000 // GROSS FUCKING HACK
+    #include <winsock2.h>
+    #include <windows.h>
+    //#include <knownfolders.h> // FUCK THAT SHIT
+    #include <shlobj.h>
+    #include <ws2tcpip.h>
+    #include <io.h>
+    #define dup _dup
+    #define socket_t    SOCKET
+    #define sockaddr_t  SOCKADDR
+#else
+    #include <unistd.h>
+    #include <netinet/in.h>
+    #include <sys/select.h>
+    #include <sys/socket.h>
+
+    #define socket_t    int
+    #define sockaddr_t  struct sockaddr
+    #define closesocket close
+#endif
+
 #include <QStandardPaths>
 #include <QDir>
 #include <QThread>
 #include <QSemaphore>
+#include <QMutex>
 #include <QOpenGLContext>
 
 #include "Platform.h"
@@ -31,38 +55,14 @@
 #include "LAN_PCap.h"
 #include <string>
 
-#ifdef __WIN32__
-#define NTDDI_VERSION        0x06000000 // GROSS FUCKING HACK
-#include <windows.h>
-//#include <knownfolders.h> // FUCK THAT SHIT
-#include <shlobj.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <io.h>
-#define dup _dup
-#define socket_t    SOCKET
-#define sockaddr_t  SOCKADDR
-#else
-
-#include <unistd.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-
-#define socket_t    int
-#define sockaddr_t  struct sockaddr
-#define closesocket close
-#endif
-
 #ifndef INVALID_SOCKET
-#define INVALID_SOCKET  (socket_t)-1
+    #define INVALID_SOCKET  (socket_t)-1
 #endif
 
 
 char* EmuDirectory;
 
 void emuStop();
-void* oglGetProcAddress(const char* proc);
 
 
 namespace Platform
@@ -187,57 +187,75 @@ FILE* OpenLocalFile(const char* path, const char* mode)
     return OpenFile(fullpath.toUtf8(), mode, mode[0] != 'w');
 }
 
-void* Thread_Create(void (* func)())
+Thread* Thread_Create(std::function<void()> func)
 {
     QThread* t = QThread::create(func);
     t->start();
-    return (void*) t;
+    return (Thread*) t;
 }
 
-void Thread_Free(void* thread)
+void Thread_Free(Thread* thread)
 {
     QThread* t = (QThread*) thread;
     t->terminate();
     delete t;
 }
 
-void Thread_Wait(void* thread)
+void Thread_Wait(Thread* thread)
 {
     ((QThread*) thread)->wait();
 }
 
-
-void* Semaphore_Create()
+Semaphore* Semaphore_Create()
 {
-    return new QSemaphore();
+    return (Semaphore*)new QSemaphore();
 }
 
-void Semaphore_Free(void* sema)
+void Semaphore_Free(Semaphore* sema)
 {
     delete (QSemaphore*) sema;
 }
 
-void Semaphore_Reset(void* sema)
+void Semaphore_Reset(Semaphore* sema)
 {
     QSemaphore* s = (QSemaphore*) sema;
 
     s->acquire(s->available());
 }
 
-void Semaphore_Wait(void* sema)
+void Semaphore_Wait(Semaphore* sema)
 {
     ((QSemaphore*) sema)->acquire();
 }
 
-void Semaphore_Post(void* sema)
+void Semaphore_Post(Semaphore* sema, int count)
 {
-    ((QSemaphore*) sema)->release();
+    ((QSemaphore*) sema)->release(count);
 }
 
-
-void* GL_GetProcAddress(const char* proc)
+Mutex* Mutex_Create()
 {
-    return oglGetProcAddress(proc);
+    return (Mutex*)new QMutex();
+}
+
+void Mutex_Free(Mutex* mutex)
+{
+    delete (QMutex*) mutex;
+}
+
+void Mutex_Lock(Mutex* mutex)
+{
+    ((QMutex*) mutex)->lock();
+}
+
+void Mutex_Unlock(Mutex* mutex)
+{
+    ((QMutex*) mutex)->unlock();
+}
+
+bool Mutex_TryLock(Mutex* mutex)
+{
+    return ((QMutex*) mutex)->try_lock();
 }
 
 
@@ -418,5 +436,9 @@ int LAN_RecvPacket(u8* data)
         return LAN_Socket::RecvPacket(data);
 }
 
+void Sleep(u64 usecs)
+{
+    QThread::usleep(usecs);
+}
 
 }

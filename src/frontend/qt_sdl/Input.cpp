@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -98,7 +98,9 @@ int GetEventKeyVal(QKeyEvent* event)
 void KeyPress(QKeyEvent* event)
 {
     int keyHK = GetEventKeyVal(event);
-    int keyKP = keyHK & ~event->modifiers();
+    int keyKP = keyHK;
+    if (event->modifiers() != Qt::KeypadModifier)
+        keyKP &= ~event->modifiers();
 
     for (int i = 0; i < 12; i++)
         if (keyKP == Config::KeyMapping[i])
@@ -112,7 +114,9 @@ void KeyPress(QKeyEvent* event)
 void KeyRelease(QKeyEvent* event)
 {
     int keyHK = GetEventKeyVal(event);
-    int keyKP = keyHK & ~event->modifiers();
+    int keyKP = keyHK;
+    if (event->modifiers() != Qt::KeypadModifier)
+        keyKP &= ~event->modifiers();
 
     for (int i = 0; i < 12; i++)
         if (keyKP == Config::KeyMapping[i])
@@ -222,7 +226,6 @@ bool HotkeyPressed(int id)  { return HotkeyPress   & (1<<id); }
 bool HotkeyReleased(int id) { return HotkeyRelease & (1<<id); }
 
 
-// TODO: MacOS version of this!
 // distinguish between left and right modifier keys (Ctrl, Alt, Shift)
 // Qt provides no real cross-platform way to do this, so here we go
 // for Windows and Linux we can distinguish via scancodes (but both
@@ -232,6 +235,12 @@ bool IsRightModKey(QKeyEvent* event)
 {
     quint32 scan = event->nativeScanCode();
     return (scan == 0x11D || scan == 0x138 || scan == 0x36);
+}
+#elif __APPLE__
+bool IsRightModKey(QKeyEvent* event)
+{
+    quint32 scan = event->nativeVirtualKey();
+    return (scan == 0x36 || scan == 0x3C || scan == 0x3D || scan == 0x3E);
 }
 #else
 bool IsRightModKey(QKeyEvent* event)

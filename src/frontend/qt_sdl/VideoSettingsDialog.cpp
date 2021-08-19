@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -47,8 +47,12 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     grp3DRenderer = new QButtonGroup(this);
     grp3DRenderer->addButton(ui->rb3DSoftware, 0);
     grp3DRenderer->addButton(ui->rb3DOpenGL,   1);
-    connect(grp3DRenderer, SIGNAL(buttonClicked(int)), this, SLOT(onChange3DRenderer(int)));
+    connect(grp3DRenderer, SIGNAL(idClicked(int)), this, SLOT(onChange3DRenderer(int)));
     grp3DRenderer->button(Config::_3DRenderer)->setChecked(true);
+
+#ifndef OGLRENDERER_ENABLED
+    ui->rb3DOpenGL->setEnabled(false);
+#endif
 
     ui->cbGLDisplay->setChecked(Config::ScreenUseGL != 0);
 
@@ -80,6 +84,14 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
         ui->cbxGLResolution->setEnabled(true);
         ui->cbBetterPolygons->setEnabled(true);
     }
+
+    // sorry
+    ui->cbVSync->hide();
+    ui->cbVSync->setEnabled(false);
+    ui->sbVSyncInterval->hide();
+    ui->sbVSyncInterval->setEnabled(false);
+    ui->label_2->hide();
+    ui->groupBox->layout()->addItem(new QSpacerItem(1, 1, QSizePolicy::Minimum, QSizePolicy::Expanding));
 }
 
 VideoSettingsDialog::~VideoSettingsDialog()

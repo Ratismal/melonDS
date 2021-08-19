@@ -1,3 +1,21 @@
+/*
+    Copyright 2016-2021 Arisotura, RSDuck
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
 #ifndef ARMJIT_INTERNAL_H
 #define ARMJIT_INTERNAL_H
 
@@ -216,9 +234,9 @@ template <u32 Num>
 void LinkBlock(ARM* cpu, u32 codeOffset);
 
 template <typename T, int ConsoleType> T SlowRead9(u32 addr, ARMv5* cpu);
-template <typename T, int ConsoleType> void SlowWrite9(u32 addr, ARMv5* cpu, T val);
+template <typename T, int ConsoleType> void SlowWrite9(u32 addr, ARMv5* cpu, u32 val);
 template <typename T, int ConsoleType> T SlowRead7(u32 addr);
-template <typename T, int ConsoleType> void SlowWrite7(u32 addr, T val);
+template <typename T, int ConsoleType> void SlowWrite7(u32 addr, u32 val);
 
 template <bool Write, int ConsoleType> void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu);
 template <bool Write, int ConsoleType> void SlowBlockTransfer7(u32 addr, u64* data, u32 num);

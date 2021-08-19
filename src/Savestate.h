@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -22,7 +22,7 @@
 #include <stdio.h>
 #include "types.h"
 
-#define SAVESTATE_MAJOR 6
+#define SAVESTATE_MAJOR 8
 #define SAVESTATE_MINOR 0
 
 class Savestate
@@ -45,6 +45,8 @@ public:
     void Var16(u16* var);
     void Var32(u32* var);
     void Var64(u64* var);
+
+    void Bool32(bool* var);
 
     void VarArray(void* data, u32 len);
 

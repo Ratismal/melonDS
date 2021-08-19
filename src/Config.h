@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -26,7 +26,7 @@
 namespace Config
 {
 
-typedef struct
+struct ConfigEntry
 {
     char Name[32];
     int Type;
@@ -34,8 +34,7 @@ typedef struct
     int DefaultInt;
     const char* DefaultStr;
     int StrLength; // should be set to actual array length minus one
-
-} ConfigEntry;
+};
 
 FILE* GetConfigFile(const char* fileName, const char* permissions);
 bool HasConfigFile(const char* fileName);
@@ -56,6 +55,7 @@ extern int DSiSDEnable;
 extern char DSiSDPath[1024];
 
 extern int RandomizeMAC;
+extern int AudioBitrate;
 
 #ifdef JIT_ENABLED
 extern int JIT_Enable;

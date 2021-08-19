@@ -1,3 +1,21 @@
+/*
+    Copyright 2016-2021 Arisotura, RSDuck
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
 .intel_syntax noprefix
 
 #include "ARMJIT_Offsets.h"
@@ -29,8 +47,13 @@
 
 .p2align 4,,15
 
+#ifdef __APPLE__
+.global _ARM_Dispatch
+_ARM_Dispatch:
+#else
 .global ARM_Dispatch
 ARM_Dispatch:
+#endif
 #ifdef WIN64
     push rdi
     push rsi
@@ -54,8 +77,13 @@ ARM_Dispatch:
 
 .p2align 4,,15
 
+#ifdef __APPLE__
+.global _ARM_Ret
+_ARM_Ret:
+#else
 .global ARM_Ret
 ARM_Ret:
+#endif
     mov [RCPU + ARM_CPSR_offset], RCPSR
 
 #ifdef WIN64

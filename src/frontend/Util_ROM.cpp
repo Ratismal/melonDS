@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -19,12 +19,18 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <utility>
+
+#ifdef ARCHIVE_SUPPORT_ENABLED
+#include "ArchiveUtil.h"
+#endif
 #include "FrontendUtil.h"
 #include "Config.h"
-#include "qt_sdl/PlatformConfig.h" // FIXME!!!
+#include "SharedConfig.h"
 #include "Platform.h"
 
 #include "NDS.h"
+#include "DSi.h"
 #include "GBACart.h"
 
 #include "AREngine.h"
@@ -36,6 +42,8 @@ namespace Frontend
 char ROMPath     [ROMSlot_MAX][1024];
 char SRAMPath    [ROMSlot_MAX][1024];
 char PrevSRAMPath[ROMSlot_MAX][1024]; // for savestate 'undo load'
+
+char NDSROMExtension[4];
 
 bool SavestateLoaded;
 
@@ -199,18 +207,27 @@ int VerifyDSiFirmware()
     return Load_OK;
 }
 
-int VerifyDSiNAND()
+int SetupDSiNAND()
 {
     FILE* f;
     long len;
 
-    f = Platform::OpenLocalFile(Config::DSiNANDPath, "rb");
+    f = Platform::OpenLocalFile(Config::DSiNANDPath, "r+b");
     if (!f) return Load_DSiNANDMissing;
 
     // TODO: some basic checks
     // check that it has the nocash footer, and all
 
-    fclose(f);
+    DSi::SDMMCFile = f;
+
+    if (Config::DSiSDEnable)
+    {
+        f = Platform::OpenLocalFile(Config::DSiSDPath, "r+b");
+        if (f)
+            DSi::SDIOFile = f;
+        else
+            DSi::SDIOFile = Platform::OpenLocalFile(Config::DSiSDPath, "w+b");
+    }
 
     return Load_OK;
 }
@@ -243,6 +260,8 @@ void LoadCheats()
 
 int LoadBIOS()
 {
+    DSi::CloseDSiNAND();
+
     int res;
 
     res = VerifyDSBIOS();
@@ -256,7 +275,7 @@ int LoadBIOS()
         res = VerifyDSiFirmware();
         if (res != Load_OK) return res;
 
-        res = VerifyDSiNAND();
+        res = SetupDSiNAND();
         if (res != Load_OK) return res;
     }
     else
@@ -283,7 +302,7 @@ int LoadBIOS()
     return Load_OK;
 }
 
-int LoadROM(const char* file, int slot)
+int LoadROM(const u8 *romdata, u32 romlength, const char *archivefilename, const char *romfilename, const char *sramfilename, int slot)
 {
     int res;
     bool directboot = Config::DirectBoot != 0;
@@ -305,7 +324,87 @@ int LoadROM(const char* file, int slot)
         res = VerifyDSiFirmware();
         if (res != Load_OK) return res;
 
-        res = VerifyDSiNAND();
+        res = SetupDSiNAND();
+        if (res != Load_OK) return res;
+
+        GBACart::Eject();
+        ROMPath[ROMSlot_GBA][0] = '\0';
+    }
+    else
+    {
+        res = VerifyDSFirmware();
+        if (res != Load_OK)
+        {
+            if (res == Load_FirmwareNotBootable)
+                directboot = true;
+            else
+                return res;
+        }
+    }
+
+    char oldpath[1024];
+    char oldsram[1024];
+    strncpy(oldpath, ROMPath[slot], 1024);
+    strncpy(oldsram, SRAMPath[slot], 1024);
+
+    strncpy(SRAMPath[slot], sramfilename, 1024);
+    strncpy(ROMPath[slot], archivefilename, 1024);
+
+    NDS::SetConsoleType(Config::ConsoleType);
+
+    if (slot == ROMSlot_NDS && NDS::LoadROM(romdata, romlength, SRAMPath[slot], directboot))
+    {
+        SavestateLoaded = false;
+
+        LoadCheats();
+
+        // Reload the inserted GBA cartridge (if any)
+        // TODO: report failure there??
+        //if (ROMPath[ROMSlot_GBA][0] != '\0') NDS::LoadGBAROM(ROMPath[ROMSlot_GBA], SRAMPath[ROMSlot_GBA]);
+
+        strncpy(PrevSRAMPath[slot], SRAMPath[slot], 1024); // safety
+        return Load_OK;
+    }
+    else if (slot == ROMSlot_GBA && NDS::LoadGBAROM(romdata, romlength, romfilename, SRAMPath[slot]))
+    {
+        SavestateLoaded = false; // checkme??
+
+        strncpy(PrevSRAMPath[slot], SRAMPath[slot], 1024); // safety
+        return Load_OK;
+    }
+    else
+    {
+        strncpy(ROMPath[slot], oldpath, 1024);
+        strncpy(SRAMPath[slot], oldsram, 1024);
+        return Load_ROMLoadError;
+    }
+}
+
+int LoadROM(const char* file, int slot)
+{
+    DSi::CloseDSiNAND();
+
+    int res;
+    bool directboot = Config::DirectBoot != 0;
+
+    if (Config::ConsoleType == 1 && slot == 1)
+    {
+        // cannot load a GBA ROM into a DSi
+        return Load_ROMLoadError;
+    }
+
+    res = VerifyDSBIOS();
+    if (res != Load_OK) return res;
+
+    if (Config::ConsoleType == 1)
+    {
+        res = VerifyDSiBIOS();
+        if (res != Load_OK) return res;
+
+        res = VerifyDSiFirmware();
+        if (res != Load_OK) return res;
+
+        res = SetupDSiNAND();
         if (res != Load_OK) return res;
 
         GBACart::Eject();
@@ -364,6 +463,72 @@ int LoadROM(const char* file, int slot)
     }
 }
 
+void ROMIcon(u8 (&data)[512], u16 (&palette)[16], u32* iconRef)
+{
+    int index = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        for (int j = 0; j < 4; j++)
+        {
+            for (int k = 0; k < 8; k++)
+            {
+                for (int l = 0; l < 8; l++)
+                {
+                    u8 pal_index = index % 2 ?  data[index/2] >> 4 : data[index/2] & 0x0F;
+                    u8 r = ((palette[pal_index] >> 0)  & 0x1F) * 255 / 31;
+                    u8 g = ((palette[pal_index] >> 5)  & 0x1F) * 255 / 31;
+                    u8 b = ((palette[pal_index] >> 10) & 0x1F) * 255 / 31;
+                    u8 a = pal_index ? 255: 0;
+                    u32* row = &iconRef[256 * i + 32 * k + 8 * j];
+                    row[l] = (a << 24) | (r << 16) | (g << 8) | b;
+                    index++;
+                }
+            }
+        }
+    }
+}
+
+#define SEQ_FLIPV(i) ((i & 0b1000000000000000) >> 15)
+#define SEQ_FLIPH(i) ((i & 0b0100000000000000) >> 14)
+#define SEQ_PAL(i) ((i & 0b0011100000000000) >> 11)
+#define SEQ_BMP(i) ((i & 0b0000011100000000) >> 8)
+#define SEQ_DUR(i) ((i & 0b0000000011111111) >> 0)
+
+void AnimatedROMIcon(u8 (&data)[8][512], u16 (&palette)[8][16], u16 (&sequence)[64], u32 (&animatedTexRef)[32 * 32 * 64], std::vector<int> &animatedSequenceRef)
+{
+    for (int i = 0; i < 64; i++)
+    {
+        if (!sequence[i])
+            break;
+        u32* frame = &animatedTexRef[32 * 32 * i];
+        ROMIcon(data[SEQ_BMP(sequence[i])], palette[SEQ_PAL(sequence[i])], frame);
+
+        if (SEQ_FLIPH(sequence[i]))
+        {
+            for (int x = 0; x < 32; x++)
+            {
+                for (int y = 0; y < 32/2; y++) 
+                {
+                    std::swap(frame[x * 32 + y], frame[x * 32 + (32 - 1 - y)]);
+                }
+            }
+        }
+        if (SEQ_FLIPV(sequence[i]))
+        {
+            for (int x = 0; x < 32/2; x++)
+            {
+                for (int y = 0; y < 32; y++) 
+                {
+                    std::swap(frame[x * 32 + y], frame[(32 - 1 - x) * 32 + y]);
+                }
+            }
+        }
+
+        for (int j = 0; j < SEQ_DUR(sequence[i]); j++)
+            animatedSequenceRef.push_back(i);
+    }
+}
+
 void UnloadROM(int slot)
 {
     if (slot == ROMSlot_NDS)
@@ -376,10 +541,14 @@ void UnloadROM(int slot)
     }
 
     ROMPath[slot][0] = '\0';
+
+    DSi::CloseDSiNAND();
 }
 
 int Reset()
 {
+    DSi::CloseDSiNAND();
+
     int res;
     bool directboot = Config::DirectBoot != 0;
 
@@ -394,7 +563,7 @@ int Reset()
         res = VerifyDSiFirmware();
         if (res != Load_OK) return res;
 
-        res = VerifyDSiNAND();
+        res = SetupDSiNAND();
         if (res != Load_OK) return res;
 
         GBACart::Eject();
@@ -422,16 +591,76 @@ int Reset()
     }
     else
     {
-        SetupSRAMPath(0);
-        if (!NDS::LoadROM(ROMPath[ROMSlot_NDS], SRAMPath[ROMSlot_NDS], directboot))
-            return Load_ROMLoadError;
+        char ext[5] = {0}; int _len = strlen(ROMPath[ROMSlot_NDS]);
+        strncpy(ext, ROMPath[ROMSlot_NDS] + _len - 4, 4);
+
+        if(!strncasecmp(ext, ".nds", 4) || !strncasecmp(ext, ".srl", 4) || !strncasecmp(ext, ".dsi", 4))
+        {
+            SetupSRAMPath(0);
+            if (!NDS::LoadROM(ROMPath[ROMSlot_NDS], SRAMPath[ROMSlot_NDS], directboot))
+                return Load_ROMLoadError;
+        }
+#ifdef ARCHIVE_SUPPORT_ENABLED
+        else
+        {
+            u8 *romdata = nullptr; u32 romlen;
+            char romfilename[1024] = {0}, sramfilename[1024];
+            strncpy(sramfilename, SRAMPath[ROMSlot_NDS], 1024); // Use existing SRAMPath
+
+            int pos = strlen(sramfilename) - 1;
+            while(pos > 0 && sramfilename[pos] != '/' && sramfilename[pos] != '\\')
+                --pos;
+
+            strncpy(romfilename, &sramfilename[pos + 1], 1024);
+            strncpy(&romfilename[strlen(romfilename) - 3], NDSROMExtension, 3); // extension could be nds, srl or dsi
+            printf("RESET loading from archive : %s\n", romfilename);
+            romlen = Archive::ExtractFileFromArchive(ROMPath[ROMSlot_NDS], romfilename, &romdata);
+            if(!romdata)
+                return Load_ROMLoadError;
+
+            bool ok = NDS::LoadROM(romdata, romlen, sramfilename, directboot);
+            delete romdata;
+            if(!ok)
+                return Load_ROMLoadError;
+        }
+#endif
     }
 
     if (ROMPath[ROMSlot_GBA][0] != '\0')
     {
-        SetupSRAMPath(1);
-        if (!NDS::LoadGBAROM(ROMPath[ROMSlot_GBA], SRAMPath[ROMSlot_GBA]))
-            return Load_ROMLoadError;
+        char ext[5] = {0}; int _len = strlen(ROMPath[ROMSlot_GBA]);
+        strncpy(ext, ROMPath[ROMSlot_GBA] + _len - 4, 4);
+
+        if(!strncasecmp(ext, ".gba", 4))
+        {
+            SetupSRAMPath(1);
+            if (!NDS::LoadGBAROM(ROMPath[ROMSlot_GBA], SRAMPath[ROMSlot_GBA]))
+                return Load_ROMLoadError;
+        }
+#ifdef ARCHIVE_SUPPORT_ENABLED
+        else
+        {
+            u8 *romdata = nullptr; u32 romlen;
+            char romfilename[1024] = {0}, sramfilename[1024];
+            strncpy(sramfilename, SRAMPath[ROMSlot_GBA], 1024); // Use existing SRAMPath
+
+            int pos = strlen(sramfilename) - 1;
+            while(pos > 0 && sramfilename[pos] != '/' && sramfilename[pos] != '\\')
+                --pos;
+
+            strncpy(romfilename, &sramfilename[pos + 1], 1024);
+            strncpy(&romfilename[strlen(romfilename) - 3], "gba", 3);
+            printf("RESET loading from archive : %s\n", romfilename);
+            romlen = Archive::ExtractFileFromArchive(ROMPath[ROMSlot_GBA], romfilename, &romdata);
+            if(!romdata)
+                return Load_ROMLoadError;
+
+            bool ok = NDS::LoadGBAROM(romdata, romlen, romfilename, SRAMPath[ROMSlot_GBA]);
+            delete romdata;
+            if(!ok)
+                return Load_ROMLoadError;
+        }
+#endif
     }
 
     LoadCheats();
@@ -454,15 +683,24 @@ void GetSavestateName(int slot, char* filename, int len)
     }
     else
     {
-        int l = strlen(ROMPath[ROMSlot_NDS]);
+        char *rompath;
+        char ext[5] = {0}; int _len = strlen(ROMPath[ROMSlot_NDS]);
+        strncpy(ext, ROMPath[ROMSlot_NDS] + _len - 4, 4);
+
+        if(!strncasecmp(ext, ".nds", 4) || !strncasecmp(ext, ".srl", 4) || !strncasecmp(ext, ".dsi", 4))
+            rompath = ROMPath[ROMSlot_NDS];
+        else
+            rompath = SRAMPath[ROMSlot_NDS]; // If archive, construct ssname from sram file
+
+        int l = strlen(rompath);
         pos = l;
-        while (ROMPath[ROMSlot_NDS][pos] != '.' && pos > 0) pos--;
+        while (rompath[pos] != '.' && pos > 0) pos--;
         if (pos == 0) pos = l;
 
         // avoid buffer overflow. shoddy
         if (pos > len-5) pos = len-5;
 
-        strncpy(&filename[0], ROMPath[ROMSlot_NDS], pos);
+        strncpy(&filename[0], rompath, pos);
     }
     strcpy(&filename[pos], ".ml");
     filename[pos+3] = '0'+slot;
@@ -586,6 +824,21 @@ void UndoStateLoad()
         strncpy(SRAMPath[ROMSlot_NDS], PrevSRAMPath[ROMSlot_NDS], 1024);
         NDS::RelocateSave(SRAMPath[ROMSlot_NDS], false);
     }
+}
+
+int ImportSRAM(const char* filename)
+{
+    FILE* file = fopen(filename, "rb");
+    fseek(file, 0, SEEK_END);
+    u32 size = ftell(file);
+    u8* importData = new u8[size];
+    rewind(file);
+    fread(importData, size, 1, file);
+    fclose(file);
+
+    int diff = NDS::ImportSRAM(importData, size);
+    delete[] importData;
+    return diff;
 }
 
 void EnableCheats(bool enable)

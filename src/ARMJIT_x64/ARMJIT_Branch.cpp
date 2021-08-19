@@ -1,3 +1,21 @@
+/*
+    Copyright 2016-2021 Arisotura, RSDuck
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
 #include "ARMJIT_Compiler.h"
 
 using namespace Gen;
@@ -130,6 +148,16 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
         ADD(32, MDisp(RCPU, offsetof(ARM, Cycles)), Imm8(cycles));
 }
 
+void ARMv4JumpToTrampoline(ARMv4* arm, u32 addr, bool restorecpsr)
+{
+    arm->JumpTo(addr, restorecpsr);
+}
+
+void ARMv5JumpToTrampoline(ARMv5* arm, u32 addr, bool restorecpsr)
+{
+    arm->JumpTo(addr, restorecpsr);
+}
+
 void Compiler::Comp_JumpTo(Gen::X64Reg addr, bool restoreCPSR)
 {
     IrregularCycles = true;
@@ -137,7 +165,7 @@ void Compiler::Comp_JumpTo(Gen::X64Reg addr, bool restoreCPSR)
     bool cpsrDirty = CPSRDirty;
     SaveCPSR();
 
-    PushRegs(restoreCPSR);
+    PushRegs(restoreCPSR, true);
 
     MOV(64, R(ABI_PARAM1), R(RCPU));
     MOV(32, R(ABI_PARAM2), R(addr));
@@ -146,11 +174,11 @@ void Compiler::Comp_JumpTo(Gen::X64Reg addr, bool restoreCPSR)
     else
         MOV(32, R(ABI_PARAM3), Imm32(true)); // what a waste
     if (Num == 0)
-        CALL((void*)&ARMv5::JumpTo);
+        CALL((void*)&ARMv5JumpToTrampoline);
     else
-        CALL((void*)&ARMv4::JumpTo);
+        CALL((void*)&ARMv4JumpToTrampoline);
 
-    PopRegs(restoreCPSR);
+    PopRegs(restoreCPSR, true);
 
     LoadCPSR();
     // in case this instruction is skipped
@@ -265,7 +293,7 @@ void Compiler::T_Comp_BL_Merged()
         target |= 1;
 
     MOV(32, MapReg(14), Imm32((R15 - 2) | 1));
-    
+
     Comp_JumpTo(target);
 }
 

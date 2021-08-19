@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -25,6 +25,8 @@
 #include <QMainWindow>
 #include <QImage>
 #include <QActionGroup>
+#include <QTimer>
+#include <QMutex>
 
 #include <QOffscreenSurface>
 #include <QOpenGLWidget>
@@ -33,6 +35,7 @@
 #include <QOpenGLFunctions_3_2_Core>
 #include <QOpenGLShaderProgram>
 
+#include "FrontendUtil.h"
 
 class EmuThread : public QThread
 {
@@ -45,8 +48,6 @@ public:
     void initOpenGL();
     void deinitOpenGL();
 
-    void* oglGetProcAddress(const char* proc);
-
     void changeWindowTitle(char* title);
 
     // to be called from the UI thread
@@ -54,8 +55,15 @@ public:
     void emuPause();
     void emuUnpause();
     void emuStop();
+    void emuFrameStep();
 
     bool emuIsRunning();
+
+    int FrontBuffer = 0;
+    QMutex FrontBufferLock;
+
+    GLsync FrontBufferReverseSyncs[2] = {nullptr, nullptr};
+    GLsync FrontBufferSyncs[2] = {nullptr, nullptr};
 
 signals:
     void windowUpdate();
@@ -65,10 +73,15 @@ signals:
     void windowEmuStop();
     void windowEmuPause();
     void windowEmuReset();
+    void windowEmuFrameStep();
 
     void windowLimitFPSChange();
 
     void screenLayoutChange();
+
+    void windowFullscreenToggle();
+
+    void swapScreensToggle();
 
 private:
     volatile int EmuStatus;
@@ -87,19 +100,28 @@ class ScreenHandler
 
 public:
     virtual ~ScreenHandler() {}
+    QTimer* setupMouseTimer();
+    void updateMouseTimer();
+    QTimer* mouseTimer;
+    QSize screenGetMinSize(int factor);
 
 protected:
     void screenSetupLayout(int w, int h);
-
-    QSize screenGetMinSize();
 
     void screenOnMousePress(QMouseEvent* event);
     void screenOnMouseRelease(QMouseEvent* event);
     void screenOnMouseMove(QMouseEvent* event);
 
-    float screenMatrix[2][6];
+    void screenHandleTablet(QTabletEvent* event);
+    void screenHandleTouch(QTouchEvent* event);
+
+    float screenMatrix[Frontend::MaxScreenTransforms][6];
+    int screenKind[Frontend::MaxScreenTransforms];
+    int numScreens;
 
     bool touching;
+
+    void showCursor();
 };
 
 
@@ -120,6 +142,8 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
 
+    void tabletEvent(QTabletEvent* event) override;
+    bool event(QEvent* event) override;
 private slots:
     void onScreenLayoutChanged();
 
@@ -127,7 +151,7 @@ private:
     void setupScreenLayout();
 
     QImage screen[2];
-    QTransform screenTrans[2];
+    QTransform screenTrans[Frontend::MaxScreenTransforms];
 };
 
 
@@ -151,6 +175,8 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
 
+    void tabletEvent(QTabletEvent* event) override;
+    bool event(QEvent* event) override;
 private slots:
     void onScreenLayoutChanged();
 
@@ -175,8 +201,11 @@ public:
     bool hasOGL;
     QOpenGLContext* getOGLContext();
 
+    void onAppStateChanged(Qt::ApplicationState state);
+
 protected:
     void resizeEvent(QResizeEvent* event) override;
+    void changeEvent(QEvent* event) override;
 
     void keyPressEvent(QKeyEvent* event) override;
     void keyReleaseEvent(QKeyEvent* event) override;
@@ -189,18 +218,24 @@ signals:
 
 private slots:
     void onOpenFile();
+    void onOpenFileArchive();
+    void onClickRecentFile();
+    void onClearRecentFiles();
     void onBootFirmware();
     void onSaveState();
     void onLoadState();
     void onUndoStateLoad();
+    void onImportSavefile();
     void onQuit();
 
     void onPause(bool checked);
     void onReset();
     void onStop();
+    void onFrameStep();
     void onEnableCheats(bool checked);
     void onSetupCheats();
     void onCheatsDialogFinished(int res);
+    void onROMInfo();
 
     void onOpenEmuSettings();
     void onEmuSettingsDialogFinished(int res);
@@ -208,15 +243,22 @@ private slots:
     void onInputConfigFinished(int res);
     void onOpenVideoSettings();
     void onOpenAudioSettings();
+    void onUpdateAudioSettings();
     void onAudioSettingsFinished(int res);
     void onOpenWifiSettings();
     void onWifiSettingsFinished(int res);
+    void onOpenInterfaceSettings();
+    void onInterfaceSettingsFinished(int res);
+    void onUpdateMouseTimer();
     void onChangeSavestateSRAMReloc(bool checked);
     void onChangeScreenSize();
     void onChangeScreenRotation(QAction* act);
     void onChangeScreenGap(QAction* act);
     void onChangeScreenLayout(QAction* act);
+    void onChangeScreenSwap(bool checked);
     void onChangeScreenSizing(QAction* act);
+    void onChangeScreenAspectTop(QAction* act);
+    void onChangeScreenAspectBot(QAction* act);
     void onChangeIntegerScaling(bool checked);
     void onChangeScreenFiltering(bool checked);
     void onChangeShowOSD(bool checked);
@@ -230,32 +272,54 @@ private slots:
 
     void onUpdateVideoSettings(bool glchange);
 
+    void onFullscreenToggled();
+
 private:
+    QList<QString> recentFileList;
+    QMenu *recentMenu;
+    void updateRecentFilesMenu();
+    void loadROM(QString filename);
+    void loadROM(QByteArray *romData, QString archiveFileName, QString romFileName);
+
+    QString pickAndExtractFileFromArchive(QString archiveFileName, QByteArray *romBuffer);
+
     void createScreenPanel();
 
     QString loadErrorStr(int error);
 
+    bool pausedManually = false;
+
+    int oldW, oldH;
+    bool oldMax;
+
 public:
     QWidget* panel;
+    ScreenPanelGL* panelGL;
+    ScreenPanelNative* panelNative;
 
     QAction* actOpenROM;
+    QAction* actOpenROMArchive;
     QAction* actBootFirmware;
     QAction* actSaveState[9];
     QAction* actLoadState[9];
     QAction* actUndoStateLoad;
+    QAction* actImportSavefile;
     QAction* actQuit;
 
     QAction* actPause;
     QAction* actReset;
     QAction* actStop;
+    QAction* actFrameStep;
     QAction* actEnableCheats;
     QAction* actSetupCheats;
+    QAction* actROMInfo;
 
     QAction* actEmuSettings;
     QAction* actInputConfig;
     QAction* actVideoSettings;
     QAction* actAudioSettings;
     QAction* actWifiSettings;
+    QAction* actInterfaceSettings;
     QAction* actSavestateSRAMReloc;
     QAction* actScreenSize[4];
     QActionGroup* grpScreenRotation;
@@ -263,10 +327,15 @@ public:
     QActionGroup* grpScreenGap;
     QAction* actScreenGap[6];
     QActionGroup* grpScreenLayout;
-    QAction* actScreenLayout[3];
+    QAction* actScreenLayout[4];
+    QAction* actScreenSwap;
     QActionGroup* grpScreenSizing;
-    QAction* actScreenSizing[4];
+    QAction* actScreenSizing[6];
     QAction* actIntegerScaling;
+    QActionGroup* grpScreenAspectTop;
+    QAction* actScreenAspectTop[4];
+    QActionGroup* grpScreenAspectBot;
+    QAction* actScreenAspectBot[4];
     QAction* actScreenFiltering;
     QAction* actShowOSD;
     QAction* actLimitFramerate;

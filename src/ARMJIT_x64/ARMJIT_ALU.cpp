@@ -1,3 +1,21 @@
+/*
+    Copyright 2016-2021 Arisotura, RSDuck
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
 #include "ARMJIT_Compiler.h"
 
 using namespace Gen;
@@ -110,7 +128,7 @@ OpArg Compiler::A_Comp_GetALUOp2(bool S, bool& carryUsed)
         Comp_AddCycles_C();
 
         u32 shift = (CurInstr.Instr >> 7) & 0x1E;
-        u32 imm = ROR(CurInstr.Instr & 0xFF, shift);
+        u32 imm = ::ROR(CurInstr.Instr & 0xFF, shift);
 
         carryUsed = false;
         if (S && shift)
@@ -209,7 +227,8 @@ void Compiler::A_Comp_Arith()
         Comp_ArithTriOp(&Compiler::AND, rd, rn, op2, carryUsed, sFlag|opSymmetric|opInvertOp2);
         break;
     default:
-        assert("unimplemented");
+        printf("this is a JIT bug! %04x\n", op);
+        abort();
     }
 
     if (CurInstr.A_Reg(12) == 15)
@@ -493,7 +512,7 @@ OpArg Compiler::Comp_RegShiftReg(int op, Gen::OpArg rs, Gen::OpArg rm, bool S, b
     {
         if (S)
             BT(32, R(RSCRATCH), Imm8(31));
-        ROR_(32, R(RSCRATCH), R(ECX));
+        ROR(32, R(RSCRATCH), R(ECX));
         if (S)
             SETcc(CC_C, R(RSCRATCH2));
     }
@@ -555,7 +574,7 @@ OpArg Compiler::Comp_RegShiftImm(int op, int amount, OpArg rm, bool S, bool& car
     case 3: // ROR
         MOV(32, R(RSCRATCH), rm);
         if (amount > 0)
-            ROR_(32, R(RSCRATCH), Imm8(amount));
+            ROR(32, R(RSCRATCH), Imm8(amount));
         else
         {
             BT(32, R(RCPSR), Imm8(29));
@@ -566,7 +585,7 @@ OpArg Compiler::Comp_RegShiftImm(int op, int amount, OpArg rm, bool S, bool& car
         return R(RSCRATCH);
     }
 
-    assert(false);
+    abort();
 }
 
 void Compiler::T_Comp_ShiftImm()

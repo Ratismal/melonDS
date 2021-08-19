@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 #include "Config.h"
 #include "NDS.h"
 #include "DSi.h"
@@ -35,6 +36,8 @@
 #include "DSi_I2C.h"
 #include "DSi_SD.h"
 #include "DSi_AES.h"
+#include "DSi_DSP.h"
+#include "DSi_Camera.h"
 
 #include "tiny-AES-c/aes.hpp"
 
@@ -49,6 +52,7 @@ u16 SCFG_Clock9;
 u16 SCFG_Clock7;
 u32 SCFG_EXT[2];
 u32 SCFG_MC;
+u16 SCFG_RST;
 
 u8 ARM9iBIOS[0x10000];
 u8 ARM7iBIOS[0x10000];
@@ -73,6 +77,9 @@ DSi_NDMA* NDMAs[8];
 DSi_SDHost* SDMMC;
 DSi_SDHost* SDIO;
 
+FILE* SDMMCFile;
+FILE* SDIOFile;
+
 u64 ConsoleID;
 u8 eMMC_CID[16];
 
@@ -90,6 +97,7 @@ bool Init()
 
     if (!DSi_I2C::Init()) return false;
     if (!DSi_AES::Init()) return false;
+    if (!DSi_DSP::Init()) return false;
 
     NDMAs[0] = new DSi_NDMA(0, 0);
     NDMAs[1] = new DSi_NDMA(0, 1);
@@ -116,11 +124,14 @@ void DeInit()
 
     DSi_I2C::DeInit();
     DSi_AES::DeInit();
+    DSi_DSP::DeInit();
 
     for (int i = 0; i < 8; i++) delete NDMAs[i];
 
     delete SDMMC;
     delete SDIO;
+
+    CloseDSiNAND();
 }
 
 void Reset()
@@ -139,6 +150,7 @@ void Reset()
 
     DSi_I2C::Reset();
     DSi_AES::Reset();
+    DSi_DSP::Reset();
 
     SDMMC->Reset();
     SDIO->Reset();
@@ -149,6 +161,9 @@ void Reset()
     SCFG_EXT[0] = 0x8307F100;
     SCFG_EXT[1] = 0x93FFFB06;
     SCFG_MC = 0x0010;//0x0011;
+    SCFG_RST = 0;
+
+    DSi_DSP::SetRstLine(false);
 
     // LCD init flag
     GPU::DispStat[0] |= (1<<6);
@@ -169,6 +184,39 @@ void Reset()
     ARM7Write16(eaddr+0x3C, 0x0100);
     ARM7Write16(eaddr+0x3E, 0x40E0);
     ARM7Write16(eaddr+0x42, 0x0001);
+}
+
+void SetupDirectBoot()
+{
+    // If loading a NDS directly, this value should be set
+    // depending on the console type in the header at offset 12h
+    switch (NDSCart::Header.UnitCode)
+    {
+    case 0x00: /* NDS Image */
+        // on a pure NDS Image, we disable all extended features
+        // TODO: For now keep the features enabled, as you can run pure NDS in NDS Emulation anyway
+        SCFG_BIOS = 0x0303;
+        break;
+    case 0x02: /* DSi Enhanced Image */
+        SCFG_BIOS = 0x0303;
+        break;
+    default:
+        SCFG_BIOS = 0x0101; // TODO: should be zero when booting from BIOS
+        break;
+    }
+    // no NWRAM Mapping
+    for (int i = 0; i < 4; i++)
+        MapNWRAM_A(i, 0);
+    for (int i = 0; i < 8; i++)
+        MapNWRAM_B(i, 0);
+    for (int i = 0; i < 8; i++)
+        MapNWRAM_C(i, 0);
+    // No NWRAM Window
+    for (int i = 0; i < 3; i++)
+    {
+        MapNWRAMRange(0, i, 0);
+        MapNWRAMRange(1, i, 0);
+    }
 }
 
 void SoftReset()
@@ -195,6 +243,13 @@ void SoftReset()
 
     DSi_AES::Reset();
 
+
+    DSi_AES::Reset();
+    // TODO: does the DSP get reset? NWRAM doesn't, so I'm assuming no
+    // *HOWEVER*, the bootrom (which does get rerun) does remap NWRAM, and thus
+    // the DSP most likely gets reset
+    DSi_DSP::Reset();
+
     LoadNAND();
 
     SDMMC->Reset();
@@ -209,6 +264,10 @@ void SoftReset()
     SCFG_EXT[0] = 0x8307F100;
     SCFG_EXT[1] = 0x93FFFB06;
     SCFG_MC = 0x0010;//0x0011;
+    // TODO: is this actually reset?
+    SCFG_RST = 0;
+    DSi_DSP::SetRstLine(false);
+
 
     // LCD init flag
     GPU::DispStat[0] |= (1<<6);
@@ -289,6 +348,13 @@ bool LoadNAND()
 {
     printf("Loading DSi NAND\n");
 
+    // Make sure NWRAM is accessible.
+    // The Bits are set to the startup values in Reset() and we might
+    // still have them on default (0) or some bits cleared by the previous
+    // run.
+    SCFG_EXT[0] |= (1 << 25);
+    SCFG_EXT[1] |= (1 << 25);
+
     memset(NWRAM_A, 0, NWRAMSize);
     memset(NWRAM_B, 0, NWRAMSize);
     memset(NWRAM_C, 0, NWRAMSize);
@@ -301,12 +367,11 @@ bool LoadNAND()
     memset(NWRAMEnd, 0, sizeof(NWRAMEnd));
     memset(NWRAMMask, 0, sizeof(NWRAMMask));
 
-    FILE* f = Platform::OpenLocalFile(Config::DSiNANDPath, "rb");
-    if (f)
+    if (SDMMCFile)
     {
         u32 bootparams[8];
-        fseek(f, 0x220, SEEK_SET);
-        fread(bootparams, 4, 8, f);
+        fseek(SDMMCFile, 0x220, SEEK_SET);
+        fread(bootparams, 4, 8, SDMMCFile);
 
         printf("ARM9: offset=%08X size=%08X RAM=%08X size_aligned=%08X\n",
                bootparams[0], bootparams[1], bootparams[2], bootparams[3]);
@@ -319,8 +384,8 @@ bool LoadNAND()
         MBK[1][8] = 0;
 
         u32 mbk[12];
-        fseek(f, 0x380, SEEK_SET);
-        fread(mbk, 4, 12, f);
+        fseek(SDMMCFile, 0x380, SEEK_SET);
+        fread(mbk, 4, 12, SDMMCFile);
 
         MapNWRAM_A(0, mbk[0] & 0xFF);
         MapNWRAM_A(1, (mbk[0] >> 8) & 0xFF);
@@ -374,12 +439,12 @@ bool LoadNAND()
 
         AES_init_ctx_iv(&ctx, boot2key, boot2iv);
 
-        fseek(f, bootparams[0], SEEK_SET);
+        fseek(SDMMCFile, bootparams[0], SEEK_SET);
         dstaddr = bootparams[2];
         for (u32 i = 0; i < bootparams[3]; i += 16)
         {
             u8 data[16];
-            fread(data, 16, 1, f);
+            fread(data, 16, 1, SDMMCFile);
 
             for (int j = 0; j < 16; j++) tmp[j] = data[15-j];
             AES_CTR_xcrypt_buffer(&ctx, tmp, 16);
@@ -399,12 +464,12 @@ bool LoadNAND()
 
         AES_init_ctx_iv(&ctx, boot2key, boot2iv);
 
-        fseek(f, bootparams[4], SEEK_SET);
+        fseek(SDMMCFile, bootparams[4], SEEK_SET);
         dstaddr = bootparams[6];
         for (u32 i = 0; i < bootparams[7]; i += 16)
         {
             u8 data[16];
-            fread(data, 16, 1, f);
+            fread(data, 16, 1, SDMMCFile);
 
             for (int j = 0; j < 16; j++) tmp[j] = data[15-j];
             AES_CTR_xcrypt_buffer(&ctx, tmp, 16);
@@ -426,25 +491,30 @@ bool LoadNAND()
 
         // read the nocash footer
 
-        fseek(f, -0x40, SEEK_END);
+        fseek(SDMMCFile, -0x40, SEEK_END);
 
         char nand_footer[16];
         const char* nand_footer_ref = "DSi eMMC CID/CPU";
-        fread(nand_footer, 1, 16, f);
+        fread(nand_footer, 1, 16, SDMMCFile);
         if (memcmp(nand_footer, nand_footer_ref, 16))
         {
-            printf("ERROR: NAND missing nocash footer\n");
-            fclose(f);
-            return false;
+            // There is another copy of the footer at 000FF800h for the case
+            // that by external tools the image was cut off 
+            // See https://problemkaputt.de/gbatek.htm#dsisdmmcimages
+            fseek(SDMMCFile, 0x000FF800, SEEK_SET);
+            fread(nand_footer, 1, 16, SDMMCFile);
+            if (memcmp(nand_footer, nand_footer_ref, 16))
+            {
+              printf("ERROR: NAND missing nocash footer\n");
+              return false;
+            }
         }
 
-        fread(eMMC_CID, 1, 16, f);
-        fread(&ConsoleID, 1, 8, f);
+        fread(eMMC_CID, 1, 16, SDMMCFile);
+        fread(&ConsoleID, 1, 8, SDMMCFile);
 
         printf("eMMC CID: "); printhex(eMMC_CID, 16);
-        printf("Console ID: %016llX\n", ConsoleID);
-
-        fclose(f);
+        printf("Console ID: %" PRIx64 "\n", ConsoleID);
     }
 
     memset(ITCMInit, 0, 0x8000);
@@ -462,6 +532,13 @@ bool LoadNAND()
     return true;
 }
 
+void CloseDSiNAND()
+{
+    if (DSi::SDMMCFile)
+        fclose(DSi::SDMMCFile);
+    if (DSi::SDIOFile)
+        fclose(DSi::SDIOFile);
+}
 
 void RunNDMAs(u32 cpu)
 {
@@ -536,119 +613,177 @@ void StopNDMAs(u32 cpu, u32 mode)
 
 void MapNWRAM_A(u32 num, u8 val)
 {
+    // NWRAM Bank A does not allow all bits to be set
+    // possible non working combinations are caught by later code, but these are not set-able at all
+    val &= ~0x72;
+
     if (MBK[0][8] & (1 << num))
     {
         printf("trying to map NWRAM_A %d to %02X, but it is write-protected (%08X)\n", num, val, MBK[0][8]);
         return;
     }
 
-#ifdef JIT_ENABLED
-    ARMJIT_Memory::RemapNWRAM(0);
-#endif
-
     int mbkn = 0, mbks = 8*num;
 
     u8 oldval = (MBK[0][mbkn] >> mbks) & 0xFF;
     if (oldval == val) return;
 
+#ifdef JIT_ENABLED
+    ARMJIT_Memory::RemapNWRAM(0);
+#endif
+
     MBK[0][mbkn] &= ~(0xFF << mbks);
     MBK[0][mbkn] |= (val << mbks);
     MBK[1][mbkn] = MBK[0][mbkn];
 
-    u8* ptr = &NWRAM_A[num << 16];
-
-    if (oldval & 0x80)
+    // When we only update the mapping on the written MBK, we will
+    // have priority of the last witten MBK over the others
+    // However the hardware has a fixed order. Therefor 
+    // we need to iterate through them all in a fixed order and update
+    // the mapping, so the result is independend on the MBK write order
+    for (unsigned int part = 0; part < 4; part++)
     {
-        if (NWRAMMap_A[oldval & 0x01][(oldval >> 2) & 0x3] == ptr)
-            NWRAMMap_A[oldval & 0x01][(oldval >> 2) & 0x3] = NULL;
+        NWRAMMap_A[0][part] = NULL;
+        NWRAMMap_A[1][part] = NULL;
     }
-
-    if (val & 0x80)
+    for (int part = 3; part >= 0; part--)
     {
-        NWRAMMap_A[val & 0x01][(val >> 2) & 0x3] = ptr;
+        u8* ptr = &NWRAM_A[part << 16];
+
+        if ((MBK[0][0 + (part / 4)] >> ((part % 4) * 8)) & 0x80)
+        {
+            u8 mVal = (MBK[0][0 + (part / 4)] >> ((part % 4) * 8)) & 0xfd;
+
+            NWRAMMap_A[mVal & 0x03][(mVal >> 2) & 0x3] = ptr;
+        }
     }
 }
 
 void MapNWRAM_B(u32 num, u8 val)
 {
+    // NWRAM Bank B does not allow all bits to be set
+    // possible non working combinations are caught by later code, but these are not set-able at all
+    val &= ~0x60;
+
     if (MBK[0][8] & (1 << (8+num)))
     {
         printf("trying to map NWRAM_B %d to %02X, but it is write-protected (%08X)\n", num, val, MBK[0][8]);
         return;
     }
 
-#ifdef JIT_ENABLED
-    ARMJIT_Memory::RemapNWRAM(1);
-#endif
-
     int mbkn = 1+(num>>2), mbks = 8*(num&3);
 
     u8 oldval = (MBK[0][mbkn] >> mbks) & 0xFF;
     if (oldval == val) return;
 
+#ifdef JIT_ENABLED
+    ARMJIT_Memory::RemapNWRAM(1);
+#endif
+
     MBK[0][mbkn] &= ~(0xFF << mbks);
     MBK[0][mbkn] |= (val << mbks);
     MBK[1][mbkn] = MBK[0][mbkn];
 
-    u8* ptr = &NWRAM_B[num << 15];
-
-    if (oldval & 0x80)
+    // When we only update the mapping on the written MBK, we will
+    // have priority of the last witten MBK over the others
+    // However the hardware has a fixed order. Therefor 
+    // we need to iterate through them all in a fixed order and update
+    // the mapping, so the result is independend on the MBK write order
+    for (unsigned int part = 0; part < 8; part++)
     {
-        if (oldval & 0x02) oldval &= 0xFE;
-
-        if (NWRAMMap_B[oldval & 0x03][(oldval >> 2) & 0x7] == ptr)
-            NWRAMMap_B[oldval & 0x03][(oldval >> 2) & 0x7] = NULL;
+        NWRAMMap_B[0][part] = NULL;
+        NWRAMMap_B[1][part] = NULL;
+        NWRAMMap_B[2][part] = NULL;
     }
-
-    if (val & 0x80)
+    for (int part = 7; part >= 0; part--)
     {
-        if (val & 0x02) val &= 0xFE;
+        u8* ptr = &NWRAM_B[part << 15];
 
-        NWRAMMap_B[val & 0x03][(val >> 2) & 0x7] = ptr;
+        if (part == num)
+        {
+            DSi_DSP::OnMBKCfg('B', num, oldval, val, ptr);
+        }
+
+        if ((MBK[0][1 + (part / 4)] >> ((part % 4) * 8)) & 0x80)
+        {
+            u8 mVal = (MBK[0][1 + (part / 4)] >> ((part % 4) * 8)) & 0xff;
+            if (mVal & 0x02) mVal &= 0xFE;
+
+            NWRAMMap_B[mVal & 0x03][(mVal >> 2) & 0x7] = ptr;
+        }
     }
 }
 
 void MapNWRAM_C(u32 num, u8 val)
 {
+    // NWRAM Bank C does not allow all bits to be set
+    // possible non working combinations are caught by later code, but these are not set-able at all
+    val &= ~0x60;
+
     if (MBK[0][8] & (1 << (16+num)))
     {
         printf("trying to map NWRAM_C %d to %02X, but it is write-protected (%08X)\n", num, val, MBK[0][8]);
         return;
     }
 
-#ifdef JIT_ENABLED
-    ARMJIT_Memory::RemapNWRAM(2);
-#endif
-
     int mbkn = 3+(num>>2), mbks = 8*(num&3);
 
     u8 oldval = (MBK[0][mbkn] >> mbks) & 0xFF;
     if (oldval == val) return;
 
+#ifdef JIT_ENABLED
+    ARMJIT_Memory::RemapNWRAM(2);
+#endif
+
     MBK[0][mbkn] &= ~(0xFF << mbks);
     MBK[0][mbkn] |= (val << mbks);
     MBK[1][mbkn] = MBK[0][mbkn];
 
-    u8* ptr = &NWRAM_C[num << 15];
-
-    if (oldval & 0x80)
+    // When we only update the mapping on the written MBK, we will
+    // have priority of the last witten MBK over the others
+    // However the hardware has a fixed order. Therefor 
+    // we need to iterate through them all in a fixed order and update
+    // the mapping, so the result is independend on the MBK write order
+    for (unsigned int part = 0; part < 8; part++)
     {
-        if (oldval & 0x02) oldval &= 0xFE;
-
-        if (NWRAMMap_C[oldval & 0x03][(oldval >> 2) & 0x7] == ptr)
-            NWRAMMap_C[oldval & 0x03][(oldval >> 2) & 0x7] = NULL;
+        NWRAMMap_C[0][part] = NULL;
+        NWRAMMap_C[1][part] = NULL;
+        NWRAMMap_C[2][part] = NULL;
     }
-
-    if (val & 0x80)
+    for (int part = 7; part >= 0; part--)
     {
-        if (val & 0x02) val &= 0xFE;
+        u8* ptr = &NWRAM_C[part << 15];
 
-        NWRAMMap_C[val & 0x03][(val >> 2) & 0x7] = ptr;
+        if (part == num)
+        {
+            DSi_DSP::OnMBKCfg('C', num, oldval, val, ptr);
+        }
+
+        if ((MBK[0][3 + (part / 4)] >> ((part % 4) * 8)) & 0x80)
+        {
+            u8 mVal = MBK[0][3 + (part / 4)] >> ((part % 4) *8) & 0xff;
+            if (mVal & 0x02) mVal &= 0xFE;
+            NWRAMMap_C[mVal & 0x03][(mVal >> 2) & 0x7] = ptr;
+        }
     }
 }
 
 void MapNWRAMRange(u32 cpu, u32 num, u32 val)
 {
+    // The windowing registers are not writeable in all bits
+    // We need to do this before the change test, so we do not
+    // get false "was changed" fall throughs
+    switch (num)
+    {
+        case 0:
+            val &= ~0xE00FC00F;
+            break;
+        case 1:
+        case 2:
+            val &= ~0xE007C007;
+            break;
+    }
+
     u32 oldval = MBK[cpu][5+num];
     if (oldval == val) return;
 
@@ -658,7 +793,14 @@ void MapNWRAMRange(u32 cpu, u32 num, u32 val)
 
     MBK[cpu][5+num] = val;
 
-    // TODO: what happens when the ranges are 'out of range'????
+    // Was TODO: What happens when the ranges are 'out of range'????
+    // Answer: The actual range is limited to 0x03000000 to 0x03ffffff
+    // The NWRAM can not map into the HW Register ranges and is never
+    // mapped there. However the end indizes are allowed to have a value
+    // exceeding that range, in which the accessed area is just cut
+    // at the end of the region
+    // since melonDS does this cut by the case switch in the read/write
+    // functions, we do not need to care here.
     if (num == 0)
     {
         u32 start = 0x03000000 + (((val >> 4) & 0xFF) << 16);
@@ -762,25 +904,34 @@ u8 ARM9Read8(u32 addr)
     switch (addr & 0xFF000000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+    case 0x03800000:
+        if (SCFG_EXT[0] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
-            return ptr ? *(u8*)&ptr[addr & 0xFFFF] : 0;
-        }
-        if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
-        {
-            u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
-            return ptr ? *(u8*)&ptr[addr & 0x7FFF] : 0;
-        }
-        if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
-        {
-            u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
-            return ptr ? *(u8*)&ptr[addr & 0x7FFF] : 0;
+            if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+            {
+                u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
+                return ptr ? *(u8*)&ptr[addr & 0xFFFF] : 0;
+            }
+            if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
+            {
+                u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
+                return ptr ? *(u8*)&ptr[addr & 0x7FFF] : 0;
+            }
+            if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
+            {
+                u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
+                return ptr ? *(u8*)&ptr[addr & 0x7FFF] : 0;
+            }
         }
         return NDS::ARM9Read8(addr);
 
     case 0x04000000:
         return ARM9IORead8(addr);
+
+    case 0x08000000:
+    case 0x09000000:
+    case 0x0A000000:
+        return (NDS::ExMemCnt[0] & (1<<7)) ? 0 : 0xFF;
     }
 
     return NDS::ARM9Read8(addr);
@@ -799,25 +950,34 @@ u16 ARM9Read16(u32 addr)
     switch (addr & 0xFF000000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+    case 0x03800000:
+        if (SCFG_EXT[0] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
-            return ptr ? *(u16*)&ptr[addr & 0xFFFF] : 0;
-        }
-        if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
-        {
-            u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
-            return ptr ? *(u16*)&ptr[addr & 0x7FFF] : 0;
-        }
-        if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
-        {
-            u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
-            return ptr ? *(u16*)&ptr[addr & 0x7FFF] : 0;
+            if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+            {
+                u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
+                return ptr ? *(u16*)&ptr[addr & 0xFFFF] : 0;
+            }
+            if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
+            {
+                u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
+                return ptr ? *(u16*)&ptr[addr & 0x7FFF] : 0;
+            }
+            if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
+            {
+                u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
+                return ptr ? *(u16*)&ptr[addr & 0x7FFF] : 0;
+            }
         }
         return NDS::ARM9Read16(addr);
 
     case 0x04000000:
         return ARM9IORead16(addr);
+
+    case 0x08000000:
+    case 0x09000000:
+    case 0x0A000000:
+        return (NDS::ExMemCnt[0] & (1<<7)) ? 0 : 0xFFFF;
     }
 
     return NDS::ARM9Read16(addr);
@@ -829,7 +989,6 @@ u32 ARM9Read32(u32 addr)
     {
         if ((addr >= 0xFFFF8000) && (SCFG_BIOS & (1<<0)))
             return 0xFFFFFFFF;
-
         return *(u32*)&ARM9iBIOS[addr & 0xFFFF];
     }
 
@@ -842,25 +1001,34 @@ u32 ARM9Read32(u32 addr)
         break;
 
     case 0x03000000:
-        if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+    case 0x03800000:
+        if (SCFG_EXT[0] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
-            return ptr ? *(u32*)&ptr[addr & 0xFFFF] : 0;
-        }
-        if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
-        {
-            u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
-            return ptr ? *(u32*)&ptr[addr & 0x7FFF] : 0;
-        }
-        if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
-        {
-            u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
-            return ptr ? *(u32*)&ptr[addr & 0x7FFF] : 0;
+            if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+            {
+                u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
+                return ptr ? *(u32*)&ptr[addr & 0xFFFF] : 0;
+            }
+            if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
+            {
+                u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
+                return ptr ? *(u32*)&ptr[addr & 0x7FFF] : 0;
+            }
+            if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
+            {
+                u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
+                return ptr ? *(u32*)&ptr[addr & 0x7FFF] : 0;
+            }
         }
         return NDS::ARM9Read32(addr);
 
     case 0x04000000:
         return ARM9IORead32(addr);
+
+    case 0x08000000:
+    case 0x09000000:
+    case 0x0A000000:
+        return (NDS::ExMemCnt[0] & (1<<7)) ? 0 : 0xFFFFFFFF;
     }
 
     return NDS::ARM9Read32(addr);
@@ -871,41 +1039,69 @@ void ARM9Write8(u32 addr, u8 val)
     switch (addr & 0xFF000000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+    case 0x03800000:
+        if (SCFG_EXT[0] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
             {
-                *(u8*)&ptr[addr & 0xFFFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 14) & (NWRAMMask[0][0] << 2)) | 0x80;
+                for (int page = 0; page < 4; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][0 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_A[page * 0x10000];
+                    *(u8*)&ptr[addr & 0xFFFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
-        {
-            u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
             {
-                *(u8*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[0][1] << 2)) | 0x80;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][1 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_B[page * 0x8000];
+                    *(u8*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
-        {
-            u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
             {
-                *(u8*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[0][2] << 2)) | 0x80;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][3 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_C[page * 0x8000];
+                    *(u8*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
 #endif
+                }
+                return;
             }
-            return;
         }
         return NDS::ARM9Write8(addr, val);
 
@@ -926,6 +1122,11 @@ void ARM9Write8(u32 addr, u8 val)
         case 0x00600000: GPU::WriteVRAM_BOBJ<u8>(addr, val); return;
         default: GPU::WriteVRAM_LCDC<u8>(addr, val); return;
         }
+
+    case 0x08000000:
+    case 0x09000000:
+    case 0x0A000000:
+        return;
     }
 
     return NDS::ARM9Write8(addr, val);
@@ -936,46 +1137,79 @@ void ARM9Write16(u32 addr, u16 val)
     switch (addr & 0xFF000000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+    case 0x03800000:
+        if (SCFG_EXT[0] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
             {
-                *(u16*)&ptr[addr & 0xFFFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 14) & (NWRAMMask[0][0] << 2)) | 0x80;
+                for (int page = 0; page < 4; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][0 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_A[page * 0x10000];
+                    *(u16*)&ptr[addr & 0xFFFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
-        {
-            u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
             {
-                *(u16*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[0][1] << 2)) | 0x80;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][1 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_B[page * 0x8000];
+                    *(u16*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
-        {
-            u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
             {
-                *(u16*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[0][2] << 2)) | 0x80;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][3 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_C[page * 0x8000];
+                    *(u16*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
 #endif
+                }
+                return;
             }
-            return;
         }
         return NDS::ARM9Write16(addr, val);
 
     case 0x04000000:
         ARM9IOWrite16(addr, val);
+        return;
+
+    case 0x08000000:
+    case 0x09000000:
+    case 0x0A000000:
         return;
     }
 
@@ -987,46 +1221,79 @@ void ARM9Write32(u32 addr, u32 val)
     switch (addr & 0xFF000000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
+    case 0x03800000:
+        if (SCFG_EXT[0] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[0][(addr >> 16) & NWRAMMask[0][0]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][0] && addr < NWRAMEnd[0][0])
             {
-                *(u32*)&ptr[addr & 0xFFFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 14) & (NWRAMMask[0][0] << 2)) | 0x80;
+                for (int page = 0; page < 4; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][0 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_A[page * 0x10000];
+                    *(u32*)&ptr[addr & 0xFFFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
-        {
-            u8* ptr = NWRAMMap_B[0][(addr >> 15) & NWRAMMask[0][1]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][1] && addr < NWRAMEnd[0][1])
             {
-                *(u32*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[0][1] << 2)) | 0x80;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][1 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_B[page * 0x8000];
+                    *(u32*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
-        {
-            u8* ptr = NWRAMMap_C[0][(addr >> 15) & NWRAMMask[0][2]];
-            if (ptr)
+            if (addr >= NWRAMStart[0][2] && addr < NWRAMEnd[0][2])
             {
-                *(u32*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[0][2] << 2)) | 0x80;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[0][3 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_C[page * 0x8000];
+                    *(u32*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
+                    ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
 #endif
+                }
+                return;
             }
-            return;
         }
         return NDS::ARM9Write32(addr, val);
 
     case 0x04000000:
         ARM9IOWrite32(addr, val);
+        return;
+
+    case 0x08000000:
+    case 0x09000000:
+    case 0x0A000000:
         return;
     }
 
@@ -1081,31 +1348,43 @@ u8 ARM7Read8(u32 addr)
         if (addr < NDS::ARM7BIOSProt && NDS::ARM7->R[15] >= NDS::ARM7BIOSProt)
             return 0xFF;
 
-        return *(u8*)&ARM7iBIOS[addr];
+        return *(u8*)&ARM7iBIOS[addr & 0xFFFF];
     }
 
     switch (addr & 0xFF800000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+    case 0x03800000:
+        if (SCFG_EXT[1] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
-            return ptr ? *(u8*)&ptr[addr & 0xFFFF] : 0;
-        }
-        if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
-        {
-            u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
-            return ptr ? *(u8*)&ptr[addr & 0x7FFF] : 0;
-        }
-        if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
-        {
-            u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
-            return ptr ? *(u8*)&ptr[addr & 0x7FFF] : 0;
+            if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+            {
+                u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
+                return ptr ? *(u8*)&ptr[addr & 0xFFFF] : 0;
+            }
+            if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
+            {
+                u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
+                return ptr ? *(u8*)&ptr[addr & 0x7FFF] : 0;
+            }
+            if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
+            {
+                u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
+                return ptr ? *(u8*)&ptr[addr & 0x7FFF] : 0;
+            }
         }
         return NDS::ARM7Read8(addr);
 
     case 0x04000000:
         return ARM7IORead8(addr);
+
+    case 0x08000000:
+    case 0x08800000:
+    case 0x09000000:
+    case 0x09800000:
+    case 0x0A000000:
+    case 0x0A800000:
+        return (NDS::ExMemCnt[0] & (1<<7)) ? 0xFF : 0;
     }
 
     return NDS::ARM7Read8(addr);
@@ -1122,31 +1401,43 @@ u16 ARM7Read16(u32 addr)
         if (addr < NDS::ARM7BIOSProt && NDS::ARM7->R[15] >= NDS::ARM7BIOSProt)
             return 0xFFFF;
 
-        return *(u16*)&ARM7iBIOS[addr];
+        return *(u16*)&ARM7iBIOS[addr & 0xFFFF];
     }
 
     switch (addr & 0xFF800000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+    case 0x03800000:
+        if (SCFG_EXT[1] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
-            return ptr ? *(u16*)&ptr[addr & 0xFFFF] : 0;
-        }
-        if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
-        {
-            u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
-            return ptr ? *(u16*)&ptr[addr & 0x7FFF] : 0;
-        }
-        if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
-        {
-            u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
-            return ptr ? *(u16*)&ptr[addr & 0x7FFF] : 0;
+            if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+            {
+                u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
+                return ptr ? *(u16*)&ptr[addr & 0xFFFF] : 0;
+            }
+            if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
+            {
+                u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
+                return ptr ? *(u16*)&ptr[addr & 0x7FFF] : 0;
+            }
+            if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
+            {
+                u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
+                return ptr ? *(u16*)&ptr[addr & 0x7FFF] : 0;
+            }
         }
         return NDS::ARM7Read16(addr);
 
     case 0x04000000:
         return ARM7IORead16(addr);
+
+    case 0x08000000:
+    case 0x08800000:
+    case 0x09000000:
+    case 0x09800000:
+    case 0x0A000000:
+    case 0x0A800000:
+        return (NDS::ExMemCnt[0] & (1<<7)) ? 0xFFFF : 0;
     }
 
     return NDS::ARM7Read16(addr);
@@ -1163,31 +1454,43 @@ u32 ARM7Read32(u32 addr)
         if (addr < NDS::ARM7BIOSProt && NDS::ARM7->R[15] >= NDS::ARM7BIOSProt)
             return 0xFFFFFFFF;
 
-        return *(u32*)&ARM7iBIOS[addr];
+        return *(u32*)&ARM7iBIOS[addr & 0xFFFF];
     }
 
     switch (addr & 0xFF800000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+    case 0x03800000:
+        if (SCFG_EXT[1] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
-            return ptr ? *(u32*)&ptr[addr & 0xFFFF] : 0;
-        }
-        if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
-        {
-            u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
-            return ptr ? *(u32*)&ptr[addr & 0x7FFF] : 0;
-        }
-        if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
-        {
-            u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
-            return ptr ? *(u32*)&ptr[addr & 0x7FFF] : 0;
+            if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+            {
+                u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
+                return ptr ? *(u32*)&ptr[addr & 0xFFFF] : 0;
+            }
+            if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
+            {
+                u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
+                return ptr ? *(u32*)&ptr[addr & 0x7FFF] : 0;
+            }
+            if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
+            {
+                u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
+                return ptr ? *(u32*)&ptr[addr & 0x7FFF] : 0;
+            }
         }
         return NDS::ARM7Read32(addr);
 
     case 0x04000000:
         return ARM7IORead32(addr);
+
+    case 0x08000000:
+    case 0x08800000:
+    case 0x09000000:
+    case 0x09800000:
+    case 0x0A000000:
+    case 0x0A800000:
+        return (NDS::ExMemCnt[0] & (1<<7)) ? 0xFFFFFFFF : 0;
     }
 
     return NDS::ARM7Read32(addr);
@@ -1198,46 +1501,82 @@ void ARM7Write8(u32 addr, u8 val)
     switch (addr & 0xFF800000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+    case 0x03800000:
+        if (SCFG_EXT[1] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
             {
-                *(u8*)&ptr[addr & 0xFFFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 14) & (NWRAMMask[1][0] << 2)) | 0x81;
+                for (int page = 0; page < 4; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][0 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_A[page * 0x10000];
+                    *(u8*)&ptr[addr & 0xFFFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
-        {
-            u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
             {
-                *(u8*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[1][1] << 2)) | 0x81;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][1 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_B[page * 0x8000];
+                    *(u8*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
-        {
-            u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
             {
-                *(u8*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[1][2] << 2)) | 0x81;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][3 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_C[page * 0x8000];
+                    *(u8*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
 #endif
+                }
+                return;
             }
-            return;
         }
         return NDS::ARM7Write8(addr, val);
 
     case 0x04000000:
         ARM7IOWrite8(addr, val);
+        return;
+
+    case 0x08000000:
+    case 0x08800000:
+    case 0x09000000:
+    case 0x09800000:
+    case 0x0A000000:
+    case 0x0A800000:
         return;
     }
 
@@ -1249,46 +1588,82 @@ void ARM7Write16(u32 addr, u16 val)
     switch (addr & 0xFF800000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+    case 0x03800000:
+        if (SCFG_EXT[1] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
             {
-                *(u16*)&ptr[addr & 0xFFFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 14) & (NWRAMMask[1][0] << 2)) | 0x81;
+                for (int page = 0; page < 4; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][0 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_A[page * 0x10000];
+                    *(u16*)&ptr[addr & 0xFFFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
-        {
-            u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
             {
-                *(u16*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[1][1] << 2)) | 0x81;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][1 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_B[page * 0x8000];
+                    *(u16*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
-        {
-            u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
             {
-                *(u16*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[1][2] << 2)) | 0x81;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][3 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_C[page * 0x8000];
+                    *(u16*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
 #endif
+                }
+                return;
             }
-            return;
         }
         return NDS::ARM7Write16(addr, val);
 
     case 0x04000000:
         ARM7IOWrite16(addr, val);
+        return;
+
+    case 0x08000000:
+    case 0x08800000:
+    case 0x09000000:
+    case 0x09800000:
+    case 0x0A000000:
+    case 0x0A800000:
         return;
     }
 
@@ -1300,46 +1675,82 @@ void ARM7Write32(u32 addr, u32 val)
     switch (addr & 0xFF800000)
     {
     case 0x03000000:
-        if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
+    case 0x03800000:
+        if (SCFG_EXT[1] & (1 << 25))
         {
-            u8* ptr = NWRAMMap_A[1][(addr >> 16) & NWRAMMask[1][0]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][0] && addr < NWRAMEnd[1][0])
             {
-                *(u32*)&ptr[addr & 0xFFFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 14) & (NWRAMMask[1][0] << 2)) | 0x81;
+                for (int page = 0; page < 4; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][0 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_A[page * 0x10000];
+                    *(u32*)&ptr[addr & 0xFFFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_A>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
-        {
-            u8* ptr = NWRAMMap_B[1][(addr >> 15) & NWRAMMask[1][1]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][1] && addr < NWRAMEnd[1][1])
             {
-                *(u32*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[1][1] << 2)) | 0x81;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][1 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_B[page * 0x8000];
+                    *(u32*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_B>(addr);
 #endif
+                }
+                return;
             }
-            return;
-        }
-        if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
-        {
-            u8* ptr = NWRAMMap_C[1][(addr >> 15) & NWRAMMask[1][2]];
-            if (ptr)
+            if (addr >= NWRAMStart[1][2] && addr < NWRAMEnd[1][2])
             {
-                *(u32*)&ptr[addr & 0x7FFF] = val;
+                // Write to a bank is special, as it writes to all
+                // parts that are mapped and not just the highest priority
+                // See http://melonds.kuribo64.net/board/thread.php?pid=3974#3974
+                // so we need to iterate through all parts and write to all mapped here
+                unsigned int destPartSetting = ((addr >> 13) & (NWRAMMask[1][2] << 2)) | 0x81;
+                for (int page = 0; page < 8; page++)
+                {
+                    unsigned int bankInfo = (MBK[1][3 + (page / 4)] >> ((page % 4) * 8)) & 0xff;
+                    if (bankInfo != destPartSetting)
+                        continue;
+                    u8* ptr = &NWRAM_C[page * 0x8000];
+                    *(u32*)&ptr[addr & 0x7FFF] = val;
 #ifdef JIT_ENABLED
-                ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
+                    ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWRAM_C>(addr);
 #endif
+                }
+                return;
             }
-            return;
         }
         return NDS::ARM7Write32(addr, val);
 
     case 0x04000000:
         ARM7IOWrite32(addr, val);
+        return;
+
+    case 0x08000000:
+    case 0x08800000:
+    case 0x09000000:
+    case 0x09800000:
+    case 0x0A000000:
+    case 0x0A800000:
         return;
     }
 
@@ -1394,6 +1805,7 @@ u8 ARM9IORead8(u32 addr)
     switch (addr)
     {
     case 0x04004000: return SCFG_BIOS & 0xFF;
+    case 0x04004006: return SCFG_RST  & 0xFF;
 
     CASE_READ8_32BIT(0x04004040, MBK[0][0])
     CASE_READ8_32BIT(0x04004044, MBK[0][1])
@@ -1406,6 +1818,15 @@ u8 ARM9IORead8(u32 addr)
     CASE_READ8_32BIT(0x04004060, MBK[0][8])
     }
 
+    if ((addr & 0xFFFFFF00) == 0x04004200)
+    {
+        if (!(SCFG_EXT[0] & (1<<17))) return 0;
+        return DSi_Camera::Read8(addr);
+    }
+
+    if (addr >= 0x04004300 && addr <= 0x04004400)
+        return DSi_DSP::Read16(addr);
+
     return NDS::ARM9IORead8(addr);
 }
 
@@ -1415,6 +1836,7 @@ u16 ARM9IORead16(u32 addr)
     {
     case 0x04004000: return SCFG_BIOS & 0xFF;
     case 0x04004004: return SCFG_Clock9;
+    case 0x04004006: return SCFG_RST;
     case 0x04004010: return SCFG_MC & 0xFFFF;
 
     CASE_READ16_32BIT(0x04004040, MBK[0][0])
@@ -1428,6 +1850,15 @@ u16 ARM9IORead16(u32 addr)
     CASE_READ16_32BIT(0x04004060, MBK[0][8])
     }
 
+    if ((addr & 0xFFFFFF00) == 0x04004200)
+    {
+        if (!(SCFG_EXT[0] & (1<<17))) return 0;
+        return DSi_Camera::Read16(addr);
+    }
+
+    if (addr >= 0x04004300 && addr <= 0x04004400)
+        return DSi_DSP::Read32(addr);
+
     return NDS::ARM9IORead16(addr);
 }
 
@@ -1436,6 +1867,7 @@ u32 ARM9IORead32(u32 addr)
     switch (addr)
     {
     case 0x04004000: return SCFG_BIOS & 0xFF;
+    case 0x04004004: return SCFG_Clock9 | ((u32)SCFG_RST << 16);
     case 0x04004008: return SCFG_EXT[0];
     case 0x04004010: return SCFG_MC & 0xFFFF;
 
@@ -1480,6 +1912,12 @@ u32 ARM9IORead32(u32 addr)
     case 0x04004170: return NDMAs[3]->Cnt;
     }
 
+    if ((addr & 0xFFFFFF00) == 0x04004200)
+    {
+        if (!(SCFG_EXT[0] & (1<<17))) return 0;
+        return DSi_Camera::Read32(addr);
+    }
+
     return NDS::ARM9IORead32(addr);
 }
 
@@ -1497,26 +1935,57 @@ void ARM9IOWrite8(u32 addr, u8 val)
         //if (val == 0x80 && NDS::ARM9->R[15] == 0xFFFF0268) NDS::ARM9->Halt(1);
         return;
 
-    case 0x04004040: MapNWRAM_A(0, val); return;
-    case 0x04004041: MapNWRAM_A(1, val); return;
-    case 0x04004042: MapNWRAM_A(2, val); return;
-    case 0x04004043: MapNWRAM_A(3, val); return;
-    case 0x04004044: MapNWRAM_B(0, val); return;
-    case 0x04004045: MapNWRAM_B(1, val); return;
-    case 0x04004046: MapNWRAM_B(2, val); return;
-    case 0x04004047: MapNWRAM_B(3, val); return;
-    case 0x04004048: MapNWRAM_B(4, val); return;
-    case 0x04004049: MapNWRAM_B(5, val); return;
-    case 0x0400404A: MapNWRAM_B(6, val); return;
-    case 0x0400404B: MapNWRAM_B(7, val); return;
-    case 0x0400404C: MapNWRAM_C(0, val); return;
-    case 0x0400404D: MapNWRAM_C(1, val); return;
-    case 0x0400404E: MapNWRAM_C(2, val); return;
-    case 0x0400404F: MapNWRAM_C(3, val); return;
-    case 0x04004050: MapNWRAM_C(4, val); return;
-    case 0x04004051: MapNWRAM_C(5, val); return;
-    case 0x04004052: MapNWRAM_C(6, val); return;
-    case 0x04004053: MapNWRAM_C(7, val); return;
+    case 0x04004006:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        SCFG_RST = (SCFG_RST & 0xFF00) | val;
+        DSi_DSP::SetRstLine(val & 1);
+        return;
+
+    case 0x04004040:
+    case 0x04004041:
+    case 0x04004042:
+    case 0x04004043:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAM_A(addr & 3, val);
+        return;
+    case 0x04004044:
+    case 0x04004045:
+    case 0x04004046:
+    case 0x04004047:
+    case 0x04004048:
+    case 0x04004049:
+    case 0x0400404A:
+    case 0x0400404B:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAM_B((addr - 0x04) & 7, val);
+        return;
+    case 0x0400404C:
+    case 0x0400404D:
+    case 0x0400404E:
+    case 0x0400404F:
+    case 0x04004050:
+    case 0x04004051:
+    case 0x04004052:
+    case 0x04004053:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAM_C((addr-0x0C) & 7, val);
+        return;
+    }
+
+    if ((addr & 0xFFFFFF00) == 0x04004200)
+    {
+        if (!(SCFG_EXT[0] & (1<<17))) return;
+        return DSi_Camera::Write8(addr, val);
+    }
+
+    if (addr >= 0x04004300 && addr <= 0x04004400)
+    {
+        DSi_DSP::Write8(addr, val);
+        return;
     }
 
     return NDS::ARM9IOWrite8(addr, val);
@@ -1527,48 +1996,55 @@ void ARM9IOWrite16(u32 addr, u16 val)
     switch (addr)
     {
     case 0x04004004:
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         Set_SCFG_Clock9(val);
         return;
 
+    case 0x04004006:
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        SCFG_RST = val;
+        DSi_DSP::SetRstLine(val & 1);
+        return;
+
     case 0x04004040:
-        MapNWRAM_A(0, val & 0xFF);
-        MapNWRAM_A(1, val >> 8);
-        return;
     case 0x04004042:
-        MapNWRAM_A(2, val & 0xFF);
-        MapNWRAM_A(3, val >> 8);
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAM_A((addr & 2), val & 0xFF);
+        MapNWRAM_A((addr & 2) + 1, val >> 8);
         return;
+
     case 0x04004044:
-        MapNWRAM_B(0, val & 0xFF);
-        MapNWRAM_B(1, val >> 8);
-        return;
     case 0x04004046:
-        MapNWRAM_B(2, val & 0xFF);
-        MapNWRAM_B(3, val >> 8);
-        return;
     case 0x04004048:
-        MapNWRAM_B(4, val & 0xFF);
-        MapNWRAM_B(5, val >> 8);
-        return;
     case 0x0400404A:
-        MapNWRAM_B(6, val & 0xFF);
-        MapNWRAM_B(7, val >> 8);
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAM_B(((addr - 0x04) & 6), val & 0xFF);
+        MapNWRAM_B(((addr - 0x04) & 6) + 1, val >> 8);
         return;
     case 0x0400404C:
-        MapNWRAM_C(0, val & 0xFF);
-        MapNWRAM_C(1, val >> 8);
-        return;
     case 0x0400404E:
-        MapNWRAM_C(2, val & 0xFF);
-        MapNWRAM_C(3, val >> 8);
-        return;
     case 0x04004050:
-        MapNWRAM_C(4, val & 0xFF);
-        MapNWRAM_C(5, val >> 8);
-        return;
     case 0x04004052:
-        MapNWRAM_C(6, val & 0xFF);
-        MapNWRAM_C(7, val >> 8);
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAM_C(((addr - 0x0C) & 6), val & 0xFF);
+        MapNWRAM_C(((addr - 0x0C) & 6) + 1, val >> 8);
+        return;
+    }
+
+    if ((addr & 0xFFFFFF00) == 0x04004200)
+    {
+        if (!(SCFG_EXT[0] & (1<<17))) return;
+        return DSi_Camera::Write16(addr, val);
+    }
+
+    if (addr >= 0x04004300 && addr <= 0x04004400)
+    {
+        DSi_DSP::Write16(addr, val);
         return;
     }
 
@@ -1579,8 +2055,18 @@ void ARM9IOWrite32(u32 addr, u32 val)
 {
     switch (addr)
     {
+    case 0x04004004:
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        Set_SCFG_Clock9(val & 0xFFFF);
+        SCFG_RST = val >> 16;
+        DSi_DSP::SetRstLine((val >> 16) & 1);
+        break;
+
     case 0x04004008:
         {
+            if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+                return;
             u32 oldram = (SCFG_EXT[0] >> 14) & 0x3;
             u32 newram = (val >> 14) & 0x3;
 
@@ -1614,38 +2100,60 @@ void ARM9IOWrite32(u32 addr, u32 val)
         return;
 
     case 0x04004040:
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         MapNWRAM_A(0, val & 0xFF);
         MapNWRAM_A(1, (val >> 8) & 0xFF);
         MapNWRAM_A(2, (val >> 16) & 0xFF);
         MapNWRAM_A(3, val >> 24);
         return;
     case 0x04004044:
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         MapNWRAM_B(0, val & 0xFF);
         MapNWRAM_B(1, (val >> 8) & 0xFF);
         MapNWRAM_B(2, (val >> 16) & 0xFF);
         MapNWRAM_B(3, val >> 24);
         return;
     case 0x04004048:
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         MapNWRAM_B(4, val & 0xFF);
         MapNWRAM_B(5, (val >> 8) & 0xFF);
         MapNWRAM_B(6, (val >> 16) & 0xFF);
         MapNWRAM_B(7, val >> 24);
         return;
     case 0x0400404C:
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         MapNWRAM_C(0, val & 0xFF);
         MapNWRAM_C(1, (val >> 8) & 0xFF);
         MapNWRAM_C(2, (val >> 16) & 0xFF);
         MapNWRAM_C(3, val >> 24);
         return;
     case 0x04004050:
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         MapNWRAM_C(4, val & 0xFF);
         MapNWRAM_C(5, (val >> 8) & 0xFF);
         MapNWRAM_C(6, (val >> 16) & 0xFF);
         MapNWRAM_C(7, val >> 24);
         return;
-    case 0x04004054: MapNWRAMRange(0, 0, val); return;
-    case 0x04004058: MapNWRAMRange(0, 1, val); return;
-    case 0x0400405C: MapNWRAMRange(0, 2, val); return;
+    case 0x04004054: 
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAMRange(0, 0, val);
+        return;
+    case 0x04004058: 
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAMRange(0, 1, val); 
+        return;
+    case 0x0400405C: 
+        if (!(SCFG_EXT[0] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAMRange(0, 2, val);
+        return;
 
     case 0x04004100: NDMACnt[0] = val & 0x800F0000; return;
     case 0x04004104: NDMAs[0]->SrcAddr = val & 0xFFFFFFFC; return;
@@ -1678,6 +2186,12 @@ void ARM9IOWrite32(u32 addr, u32 val)
     case 0x04004170: NDMAs[3]->WriteCnt(val); return;
     }
 
+    if ((addr & 0xFFFFFF00) == 0x04004200)
+    {
+        if (!(SCFG_EXT[0] & (1<<17))) return;
+        return DSi_Camera::Write32(addr, val);
+    }
+
     return NDS::ARM9IOWrite32(addr, val);
 }
 
@@ -1686,7 +2200,8 @@ u8 ARM7IORead8(u32 addr)
 {
     switch (addr)
     {
-    case 0x04004000: return SCFG_BIOS & 0xFF;
+    case 0x04004000: 
+        return SCFG_BIOS & 0xFF;
     case 0x04004001: return SCFG_BIOS >> 8;
 
     CASE_READ8_32BIT(0x04004040, MBK[1][0])
@@ -1703,7 +2218,7 @@ u8 ARM7IORead8(u32 addr)
     case 0x04004501: return DSi_I2C::Cnt;
 
     case 0x04004D00: if (SCFG_BIOS & (1<<10)) return 0; return ConsoleID & 0xFF;
-    case 0x04004fD01: if (SCFG_BIOS & (1<<10)) return 0; return (ConsoleID >> 8) & 0xFF;
+    case 0x04004D01: if (SCFG_BIOS & (1<<10)) return 0; return (ConsoleID >> 8) & 0xFF;
     case 0x04004D02: if (SCFG_BIOS & (1<<10)) return 0; return (ConsoleID >> 16) & 0xFF;
     case 0x04004D03: if (SCFG_BIOS & (1<<10)) return 0; return (ConsoleID >> 24) & 0xFF;
     case 0x04004D04: if (SCFG_BIOS & (1<<10)) return 0; return (ConsoleID >> 32) & 0xFF;
@@ -1835,11 +2350,29 @@ void ARM7IOWrite8(u32 addr, u8 val)
     switch (addr)
     {
     case 0x04004000:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         SCFG_BIOS |= (val & 0x03);
         return;
     case 0x04004001:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         SCFG_BIOS |= ((val & 0x07) << 8);
         return;
+    case 0x04004060:
+    case 0x04004061:
+    case 0x04004062:
+    case 0x04004063:
+    {
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        u32 tmp = MBK[0][8];
+        tmp &= ~(0xff << ((addr % 4) * 8));
+        tmp |= (val << ((addr % 4) * 8));
+        MBK[0][8] = tmp & 0x00FFFF0F;
+        MBK[1][8] = MBK[0][8];
+        return;
+    }
 
     case 0x04004500: DSi_I2C::WriteData(val); return;
     case 0x04004501: DSi_I2C::WriteCnt(val); return;
@@ -1852,18 +2385,34 @@ void ARM7IOWrite16(u32 addr, u16 val)
 {
     switch (addr)
     {
-    case 0x04000218: NDS::IE2 = (val & 0x7FF7); NDS::UpdateIRQ(1); return;
-    case 0x0400021C: NDS::IF2 &= ~(val & 0x7FF7); NDS::UpdateIRQ(1); return;
+        case 0x04000218: NDS::IE2 = (val & 0x7FF7); NDS::UpdateIRQ(1); return;
+        case 0x0400021C: NDS::IF2 &= ~(val & 0x7FF7); NDS::UpdateIRQ(1); return;
 
-    case 0x04004000:
-        SCFG_BIOS |= (val & 0x0703);
-        return;
-    case 0x04004004:
-        SCFG_Clock7 = val & 0x0187;
-        return;
-    case 0x04004010:
-        Set_SCFG_MC((SCFG_MC & 0xFFFF0000) | val);
-        return;
+        case 0x04004000:
+            if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+                return;
+            SCFG_BIOS |= (val & 0x0703);
+            return;
+        case 0x04004004:
+            if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+                return;
+            SCFG_Clock7 = val & 0x0187;
+            return;
+        case 0x04004010:
+            if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+                return;
+            Set_SCFG_MC((SCFG_MC & 0xFFFF0000) | val);
+            return;
+        case 0x04004060:
+        case 0x04004062:
+            if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+                return;
+            u32 tmp = MBK[0][8];
+            tmp &= ~(0xffff << ((addr % 4) * 8));
+            tmp |= (val << ((addr % 4) * 8));
+            MBK[0][8] = tmp & 0x00FFFF0F;
+            MBK[1][8] = MBK[0][8];
+            return;
     }
 
     if (addr >= 0x04004800 && addr < 0x04004A00)
@@ -1888,9 +2437,13 @@ void ARM7IOWrite32(u32 addr, u32 val)
     case 0x0400021C: NDS::IF2 &= ~(val & 0x7FF7); NDS::UpdateIRQ(1); return;
 
     case 0x04004000:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         SCFG_BIOS |= (val & 0x0703);
         return;
     case 0x04004008:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         SCFG_EXT[0] &= ~0x03000000;
         SCFG_EXT[0] |= (val & 0x03000000);
         SCFG_EXT[1] &= ~0x93FF0F07;
@@ -1898,13 +2451,33 @@ void ARM7IOWrite32(u32 addr, u32 val)
         printf("SCFG_EXT = %08X / %08X (val7 %08X)\n", SCFG_EXT[0], SCFG_EXT[1], val);
         return;
     case 0x04004010:
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
         Set_SCFG_MC(val);
         return;
 
-    case 0x04004054: MapNWRAMRange(1, 0, val); return;
-    case 0x04004058: MapNWRAMRange(1, 1, val); return;
-    case 0x0400405C: MapNWRAMRange(1, 2, val); return;
-    case 0x04004060: val &= 0x00FFFF0F; MBK[0][8] = val; MBK[1][8] = val; return;
+    case 0x04004054: 
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAMRange(1, 0, val);
+        return;
+    case 0x04004058: 
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAMRange(1, 1, val);
+        return;
+    case 0x0400405C: 
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        MapNWRAMRange(1, 2, val);
+        return;
+    case 0x04004060: 
+        if (!(SCFG_EXT[1] & (1 << 31))) /* no access to SCFG Registers if disabled*/
+            return;
+        val &= 0x00FFFF0F;
+        MBK[0][8] = val; 
+        MBK[1][8] = val; 
+        return;
 
     case 0x04004100: NDMACnt[1] = val & 0x800F0000; return;
     case 0x04004104: NDMAs[4]->SrcAddr = val & 0xFFFFFFFC; return;
@@ -1979,6 +2552,13 @@ void ARM7IOWrite32(u32 addr, u32 val)
         if (addr == 0x04004B0C) { SDIO->WriteFIFO32(val); return; }
         SDIO->Write(addr, val & 0xFFFF);
         SDIO->Write(addr+2, val >> 16);
+        return;
+    }
+
+
+    if (addr >= 0x04004300 && addr <= 0x04004400)
+    {
+        DSi_DSP::Write32(addr, val);
         return;
     }
 

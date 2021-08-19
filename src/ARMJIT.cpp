@@ -1,3 +1,21 @@
+/*
+    Copyright 2016-2021 Arisotura, RSDuck
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
 #include "ARMJIT.h"
 
 #include <string.h>
@@ -25,10 +43,11 @@
 #include "Wifi.h"
 #include "NDSCart.h"
 
+
 #include "ARMJIT_x64/ARMJIT_Offsets.h"
-static_assert(offsetof(ARM, CPSR) == ARM_CPSR_offset);
-static_assert(offsetof(ARM, Cycles) == ARM_Cycles_offset);
-static_assert(offsetof(ARM, StopExecution) == ARM_StopExecution_offset);
+static_assert(offsetof(ARM, CPSR) == ARM_CPSR_offset, "");
+static_assert(offsetof(ARM, Cycles) == ARM_Cycles_offset, "");
+static_assert(offsetof(ARM, StopExecution) == ARM_StopExecution_offset, "");
 
 namespace ARMJIT
 {
@@ -176,7 +195,7 @@ T SlowRead9(u32 addr, ARMv5* cpu)
 }
 
 template <typename T, int ConsoleType>
-void SlowWrite9(u32 addr, ARMv5* cpu, T val)
+void SlowWrite9(u32 addr, ARMv5* cpu, u32 val)
 {
     addr &= ~(sizeof(T) - 1);
 
@@ -224,7 +243,7 @@ T SlowRead7(u32 addr)
 }
 
 template <typename T, int ConsoleType>
-void SlowWrite7(u32 addr, T val)
+void SlowWrite7(u32 addr, u32 val)
 {
     addr &= ~(sizeof(T) - 1);
 
@@ -240,7 +259,7 @@ template <bool Write, int ConsoleType>
 void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 {
     addr &= ~0x3;
-    for (int i = 0; i < num; i++)
+    for (u32 i = 0; i < num; i++)
     {
         if (Write)
             SlowWrite9<u32, ConsoleType>(addr, cpu, data[i]);
@@ -254,7 +273,7 @@ template <bool Write, int ConsoleType>
 void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
 {
     addr &= ~0x3;
-    for (int i = 0; i < num; i++)
+    for (u32 i = 0; i < num; i++)
     {
         if (Write)
             SlowWrite7<u32, ConsoleType>(addr, data[i]);
@@ -266,16 +285,16 @@ void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
 
 #define INSTANTIATE_SLOWMEM(consoleType) \
     template void SlowWrite9<u32, consoleType>(u32, ARMv5*, u32); \
-    template void SlowWrite9<u16, consoleType>(u32, ARMv5*, u16); \
-    template void SlowWrite9<u8, consoleType>(u32, ARMv5*, u8); \
+    template void SlowWrite9<u16, consoleType>(u32, ARMv5*, u32); \
+    template void SlowWrite9<u8, consoleType>(u32, ARMv5*, u32); \
     \
     template u32 SlowRead9<u32, consoleType>(u32, ARMv5*); \
     template u16 SlowRead9<u16, consoleType>(u32, ARMv5*); \
     template u8 SlowRead9<u8, consoleType>(u32, ARMv5*); \
     \
     template void SlowWrite7<u32, consoleType>(u32, u32); \
-    template void SlowWrite7<u16, consoleType>(u32, u16); \
-    template void SlowWrite7<u8, consoleType>(u32, u8); \
+    template void SlowWrite7<u16, consoleType>(u32, u32); \
+    template void SlowWrite7<u8, consoleType>(u32, u32); \
     \
     template u32 SlowRead7<u32, consoleType>(u32); \
     template u16 SlowRead7<u16, consoleType>(u32); \
@@ -298,6 +317,8 @@ void Init()
 
 void DeInit()
 {
+    JitEnableWrite();
+    ResetBlockCache();
     ARMJIT_Memory::DeInit();
 
     delete JITCompiler;
@@ -305,6 +326,7 @@ void DeInit()
 
 void Reset()
 {
+    JitEnableWrite();
     ResetBlockCache();
 
     ARMJIT_Memory::Reset();
@@ -594,7 +616,8 @@ void CompileBlock(ARM* cpu)
     u32 r15 = cpu->R[15];
 
     u32 addressRanges[Config::JIT_MaxBlockSize];
-    u32 addressMasks[Config::JIT_MaxBlockSize] = {0};
+    u32 addressMasks[Config::JIT_MaxBlockSize];
+    memset(addressMasks, 0, Config::JIT_MaxBlockSize * sizeof(u32));
     u32 numAddressRanges = 0;
 
     u32 numLiterals = 0;
@@ -602,6 +625,8 @@ void CompileBlock(ARM* cpu)
     // they are going to be hashed
     u32 literalValues[Config::JIT_MaxBlockSize];
     u32 instrValues[Config::JIT_MaxBlockSize];
+    // due to instruction merging i might not reflect the amount of actual instructions
+    u32 numInstrs = 0;
 
     cpu->FillPipeline();
     u32 nextInstr[2] = {cpu->NextInstr[0], cpu->NextInstr[1]};
@@ -613,6 +638,8 @@ void CompileBlock(ARM* cpu)
     u32 lr;
     bool hasLink = false;
 
+    bool hasMemoryInstr = false;
+
     do
     {
         r15 += thumb ? 2 : 4;
@@ -621,13 +648,13 @@ void CompileBlock(ARM* cpu)
         instrs[i].SetFlags = 0;
         instrs[i].Instr = nextInstr[0];
         nextInstr[0] = nextInstr[1];
-    
+
         instrs[i].Addr = nextInstrAddr[0];
         nextInstrAddr[0] = nextInstrAddr[1];
         nextInstrAddr[1] = r15;
         JIT_DEBUGPRINT("instr %08x %x\n", instrs[i].Instr & (thumb ? 0xFFFF : ~0), instrs[i].Addr);
 
-        instrValues[i] = instrs[i].Instr;
+        instrValues[numInstrs++] = instrs[i].Instr;
 
         u32 translatedAddr = LocaliseCodeAddress(cpu->Num, instrs[i].Addr);
         assert(translatedAddr >> 27);
@@ -635,7 +662,7 @@ void CompileBlock(ARM* cpu)
         if (i == 0 || translatedAddrRounded != addressRanges[numAddressRanges - 1])
         {
             bool returning = false;
-            for (int j = 0; j < numAddressRanges; j++)
+            for (u32 j = 0; j < numAddressRanges; j++)
             {
                 if (addressRanges[j] == translatedAddrRounded)
                 {
@@ -674,6 +701,10 @@ void CompileBlock(ARM* cpu)
             instrs[i].CodeCycles = cpu->CodeCycles;
         }
         instrs[i].Info = ARMInstrInfo::Decode(thumb, cpu->Num, instrs[i].Instr);
+
+        hasMemoryInstr |= thumb
+            ? (instrs[i].Info.Kind >= ARMInstrInfo::tk_LDR_PCREL && instrs[i].Info.Kind <= ARMInstrInfo::tk_STMIA)
+            : (instrs[i].Info.Kind >= ARMInstrInfo::ak_STR_REG_LSL && instrs[i].Info.Kind <= ARMInstrInfo::ak_STM);
 
         cpu->R[15] = r15;
         cpu->CurInstr = instrs[i].Instr;
@@ -739,15 +770,17 @@ void CompileBlock(ARM* cpu)
         if (thumb && instrs[i].Info.Kind == ARMInstrInfo::tk_BL_LONG_2 && i > 0
             && instrs[i - 1].Info.Kind == ARMInstrInfo::tk_BL_LONG_1)
         {
-            instrs[i - 1].Info.Kind = ARMInstrInfo::tk_BL_LONG;
-            instrs[i - 1].Instr = (instrs[i - 1].Instr & 0xFFFF) | (instrs[i].Instr << 16);
-            instrs[i - 1].Info.DstRegs = 0xC000;
-            instrs[i - 1].Info.SrcRegs = 0;
-            instrs[i - 1].Info.EndBlock = true;
             i--;
+            instrs[i].Info.Kind = ARMInstrInfo::tk_BL_LONG;
+            instrs[i].Instr = (instrs[i].Instr & 0xFFFF) | (instrs[i + 1].Instr << 16);
+            instrs[i].Info.DstRegs = 0xC000;
+            instrs[i].Info.SrcRegs = 0;
+            instrs[i].Info.EndBlock = true;
+            JIT_DEBUGPRINT("merged BL\n");
         }
 
-        if (instrs[i].Info.Branches() && Config::JIT_BranchOptimisations)
+        if (instrs[i].Info.Branches() && Config::JIT_BranchOptimisations
+            && instrs[i].Info.Kind != (thumb ? ARMInstrInfo::tk_SVC : ARMInstrInfo::ak_SVC))
         {
             bool hasBranched = cpu->R[15] != r15;
 
@@ -813,6 +846,7 @@ void CompileBlock(ARM* cpu)
 
             if (!hasBranched && cond < 0xE && i + 1 < Config::JIT_MaxBlockSize)
             {
+                JIT_DEBUGPRINT("block lengthened by untaken branch\n");
                 instrs[i].Info.EndBlock = false;
                 instrs[i].BranchFlags |= branch_FollowCondNotTaken;
             }
@@ -827,7 +861,7 @@ void CompileBlock(ARM* cpu)
     } while(!instrs[i - 1].Info.EndBlock && i < Config::JIT_MaxBlockSize && !cpu->Halted && (!cpu->IRQ || (cpu->CPSR & 0x80)));
 
     u32 literalHash = (u32)XXH3_64bits(literalValues, numLiterals * 4);
-    u32 instrHash = (u32)XXH3_64bits(instrValues, i * 4);
+    u32 instrHash = (u32)XXH3_64bits(instrValues, numInstrs * 4);
 
     auto prevBlockIt = RestoreCandidates.find(instrHash);
     JitBlock* prevBlock = NULL;
@@ -841,7 +875,7 @@ void CompileBlock(ARM* cpu)
 
         if (mayRestore && prevBlock->NumAddresses == numAddressRanges)
         {
-            for (int j = 0; j < numAddressRanges; j++)
+            for (u32 j = 0; j < numAddressRanges; j++)
             {
                 if (prevBlock->AddressRanges()[j] != addressRanges[j]
                     || prevBlock->AddressMasks()[j] != addressMasks[j])
@@ -868,9 +902,9 @@ void CompileBlock(ARM* cpu)
         block = new JitBlock(cpu->Num, i, numAddressRanges, numLiterals);
         block->LiteralHash = literalHash;
         block->InstrHash = instrHash;
-        for (int j = 0; j < numAddressRanges; j++)
+        for (u32 j = 0; j < numAddressRanges; j++)
             block->AddressRanges()[j] = addressRanges[j];
-        for (int j = 0; j < numAddressRanges; j++)
+        for (u32 j = 0; j < numAddressRanges; j++)
             block->AddressMasks()[j] = addressMasks[j];
         for (int j = 0; j < numLiterals; j++)
             block->Literals()[j] = literalLoadAddrs[j];
@@ -879,8 +913,10 @@ void CompileBlock(ARM* cpu)
         block->StartAddrLocal = localAddr;
 
         FloodFillSetFlags(instrs, i - 1, 0xF);
-
-        block->EntryPoint = JITCompiler->CompileBlock(cpu, thumb, instrs, i);
+        
+        JitEnableWrite();
+        block->EntryPoint = JITCompiler->CompileBlock(cpu, thumb, instrs, i, hasMemoryInstr);
+        JitEnableExecute();
 
         JIT_DEBUGPRINT("block start %p\n", block->EntryPoint);
     }
@@ -891,7 +927,7 @@ void CompileBlock(ARM* cpu)
     }
 
     assert((localAddr & 1) == 0);
-    for (int j = 0; j < numAddressRanges; j++)
+    for (u32 j = 0; j < numAddressRanges; j++)
     {
         assert(addressRanges[j] == block->AddressRanges()[j]);
         assert(addressMasks[j] == block->AddressMasks()[j]);
@@ -1087,7 +1123,10 @@ void ResetBlockCache()
 
     InvalidLiterals.Clear();
     for (int i = 0; i < ARMJIT_Memory::memregions_Count; i++)
-        memset(FastBlockLookupRegions[i], 0xFF, CodeRegionSizes[i] * sizeof(u64) / 2);
+    {
+        if (FastBlockLookupRegions[i])
+            memset(FastBlockLookupRegions[i], 0xFF, CodeRegionSizes[i] * sizeof(u64) / 2);
+    }
     for (auto it = RestoreCandidates.begin(); it != RestoreCandidates.end(); it++)
         delete it->second;
     RestoreCandidates.clear();
@@ -1113,11 +1152,28 @@ void ResetBlockCache()
             range->Blocks.Clear();
             range->Code = 0;
         }
+        delete block;
     }
     JitBlocks9.clear();
     JitBlocks7.clear();
 
     JITCompiler->Reset();
+}
+
+void JitEnableWrite()
+{
+    #if defined(__APPLE__) && defined(__aarch64__)
+        if (__builtin_available(macOS 11.0, *))
+            pthread_jit_write_protect_np(false);
+    #endif
+}
+
+void JitEnableExecute()
+{
+    #if defined(__APPLE__) && defined(__aarch64__)
+        if (__builtin_available(macOS 11.0, *))
+            pthread_jit_write_protect_np(true);
+    #endif
 }
 
 }

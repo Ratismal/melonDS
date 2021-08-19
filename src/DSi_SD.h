@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2020 Arisotura
+    Copyright 2016-2021 Arisotura
 
     This file is part of melonDS.
 
@@ -85,11 +85,11 @@ private:
     u32 Param;
     u16 ResponseBuffer[8];
 
-    FIFO<u16>* DataFIFO[2];
-    u32 CurFIFO; // FIFO accessible for read/write
-    FIFO<u32>* DataFIFO32;
-
     DSi_SDDevice* Ports[2];
+
+    u32 CurFIFO; // FIFO accessible for read/write
+    FIFO<u16, 0x100> DataFIFO[2];
+    FIFO<u32, 0x80> DataFIFO32;
 
     void UpdateData32IRQ();
     void ClearIRQ(u32 irq);
@@ -103,7 +103,7 @@ class DSi_SDDevice
 {
 public:
     DSi_SDDevice(DSi_SDHost* host) { Host = host; IRQ = false; }
-    ~DSi_SDDevice() {}
+    virtual ~DSi_SDDevice() {}
 
     virtual void Reset() = 0;
 
@@ -120,7 +120,7 @@ protected:
 class DSi_MMCStorage : public DSi_SDDevice
 {
 public:
-    DSi_MMCStorage(DSi_SDHost* host, bool internal, const char* path);
+    DSi_MMCStorage(DSi_SDHost* host, bool internal, FILE* file);
     ~DSi_MMCStorage();
 
     void Reset();
@@ -134,7 +134,6 @@ public:
 
 private:
     bool Internal;
-    char FilePath[1024];
     FILE* File;
 
     u8 CID[16];
